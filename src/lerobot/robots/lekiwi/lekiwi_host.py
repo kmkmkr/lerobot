@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import base64
 import json
 import logging
@@ -47,9 +48,54 @@ class LeKiwiHost:
         self.zmq_context.term()
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("--connection-time-s must be greater than 0.")
+    return parsed
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "--robot.port",
+        dest="robot_port",
+        default="/dev/ttyACM0",
+        help="Serial port for the LeKiwi motor bus (e.g. /dev/ttyAMA10).",
+    )
+    parser.add_argument(
+        "--robot.id",
+        dest="robot_id",
+        default=None,
+        help="Optional robot id used for calibration file naming.",
+    )
+    parser.add_argument(
+        "--base-only",
+        action="store_true",
+        help="Run LeKiwi without follower arm motors (only base motors ids 7,8,9).",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--connection-time-s",
+        type=_positive_float,
+        default=None,
+        help="Run host for a fixed number of seconds.",
+    )
+    group.add_argument(
+        "--run-forever",
+        action="store_true",
+        help="Run host indefinitely until interrupted (Ctrl+C).",
+    )
+    # Keep backward compatibility with existing launch commands that may pass extra args.
+    args, _ = parser.parse_known_args()
+    return args
+
+
 def main():
+    args = _parse_args()
+
     logging.info("Configuring LeKiwi")
-    robot_config = LeKiwiConfig()
+    robot_config = LeKiwiConfig(port=args.robot_port, id=args.robot_id, has_arm=not args.base_only)
     robot = LeKiwi(robot_config)
 
     logging.info("Connecting LeKiwi")
@@ -57,16 +103,22 @@ def main():
 
     logging.info("Starting HostAgent")
     host_config = LeKiwiHostConfig()
+    if args.run_forever:
+        host_config.connection_time_s = None
+    elif args.connection_time_s is not None:
+        host_config.connection_time_s = args.connection_time_s
     host = LeKiwiHost(host_config)
 
     last_cmd_time = time.time()
     watchdog_active = False
-    logging.info("Waiting for commands...")
+    if host.connection_time_s is None:
+        logging.info("Waiting for commands (run forever)...")
+    else:
+        logging.info("Waiting for commands for %.1f seconds...", host.connection_time_s)
     try:
         # Business logic
         start = time.perf_counter()
-        duration = 0
-        while duration < host.connection_time_s:
+        while True:
             loop_start_time = time.time()
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
@@ -111,7 +163,9 @@ def main():
 
             time.sleep(max(1 / host.max_loop_freq_hz - elapsed, 0))
             duration = time.perf_counter() - start
-        print("Cycle time reached.")
+            if host.connection_time_s is not None and duration >= host.connection_time_s:
+                print("Cycle time reached.")
+                break
 
     except KeyboardInterrupt:
         print("Keyboard interrupt received. Exiting...")

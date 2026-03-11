@@ -13,7 +13,7 @@ EPISODE_TIME_SEC = 60
 TASK_DESCRIPTION = "My task description"
 
 # Create the robot and teleoperator configurations
-robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="lekiwi")
+robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="lekiwi", has_arm=False)
 robot = LeKiwiClient(robot_config)
 
 policy = ACTPolicy.from_pretrained("<hf_username>/<policy_repo_id>")
@@ -33,7 +33,7 @@ dataset = LeRobotDataset.create(
     image_writer_threads=4,
 )
 
-# To connect you already should have this script running on LeKiwi: `python -m lerobot.robots.lekiwi.lekiwi_host --robot.id=my_awesome_kiwi`
+# To connect, run this on LeKiwi first (base-only): `python -m lerobot.robots.lekiwi.lekiwi_host --base-only --run-forever`
 robot.connect()
 
 _init_rerun(session_name="recording")

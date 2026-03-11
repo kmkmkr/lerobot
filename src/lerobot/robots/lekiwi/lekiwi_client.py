@@ -17,6 +17,7 @@
 import base64
 import json
 import logging
+import math
 from functools import cached_property
 from typing import Any
 
@@ -27,6 +28,16 @@ from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..robot import Robot
 from .config_lekiwi import LeKiwiClientConfig
+
+ARM_STATE_KEYS = (
+    "arm_shoulder_pan.pos",
+    "arm_shoulder_lift.pos",
+    "arm_elbow_flex.pos",
+    "arm_wrist_flex.pos",
+    "arm_wrist_roll.pos",
+    "arm_gripper.pos",
+)
+BASE_STATE_KEYS = ("x.vel", "y.vel", "theta.vel")
 
 
 class LeKiwiClient(Robot):
@@ -41,6 +52,7 @@ class LeKiwiClient(Robot):
         self.config = config
         self.id = config.id
         self.robot_type = config.type
+        self.has_arm = config.has_arm
 
         self.remote_ip = config.remote_ip
         self.port_zmq_cmd = config.port_zmq_cmd
@@ -72,20 +84,8 @@ class LeKiwiClient(Robot):
 
     @cached_property
     def _state_ft(self) -> dict[str, type]:
-        return dict.fromkeys(
-            (
-                "arm_shoulder_pan.pos",
-                "arm_shoulder_lift.pos",
-                "arm_elbow_flex.pos",
-                "arm_wrist_flex.pos",
-                "arm_wrist_roll.pos",
-                "arm_gripper.pos",
-                "x.vel",
-                "y.vel",
-                "theta.vel",
-            ),
-            float,
-        )
+        state_keys = (*ARM_STATE_KEYS, *BASE_STATE_KEYS) if self.has_arm else BASE_STATE_KEYS
+        return dict.fromkeys(state_keys, float)
 
     @cached_property
     def _state_order(self) -> tuple[str, ...]:
@@ -216,7 +216,7 @@ class LeKiwiClient(Robot):
 
         return current_frames, obs_dict
 
-    def _get_data(self) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]]:
+    def _get_data(self) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         """
         Polls the video socket for the latest observation data.
 
@@ -302,6 +302,24 @@ class LeKiwiClient(Robot):
             "y.vel": y_cmd,
             "theta.vel": theta_cmd,
         }
+    def _from_bi_wheel_action_to_base_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        linear_vel = action.get("linear", 0.0)  # m/s
+        angular_vel = action.get("angular", 0.0)  # rad/s
+        # speed_setting = self.speed_levels[self.speed_index]
+        # v_limit = speed_setting["xy"]
+        # w_limit = speed_setting["theta"]
+        max_linear_velocity_mps = 0.1
+        max_angular_velocity_radps = 0.5
+        v_limit = max_linear_velocity_mps
+        w_limit = max_angular_velocity_radps
+        linear_vel = float(np.clip(linear_vel, -v_limit, v_limit))
+        angular_vel = float(np.clip(angular_vel, -w_limit, w_limit))
+        theta_vel_deg = float(angular_vel * 180.0 / math.pi)
+        return {
+            "x.vel": linear_vel,
+            "y.vel": 0.0,
+            "theta.vel": theta_vel_deg,
+        }
 
     def configure(self):
         pass
@@ -323,10 +341,15 @@ class LeKiwiClient(Robot):
                 "ManipulatorRobot is not connected. You need to run `robot.connect()`."
             )
 
-        self.zmq_cmd_socket.send_string(json.dumps(action))  # action is in motor space
+        if self.has_arm:
+            action_to_send = {key: float(value) for key, value in action.items()}
+        else:
+            action_to_send = {key: float(action.get(key, 0.0)) for key in self._state_order}
+
+        self.zmq_cmd_socket.send_string(json.dumps(action_to_send))
 
         # TODO(Steven): Remove the np conversion when it is possible to record a non-numpy array value
-        actions = np.array([action.get(k, 0.0) for k in self._state_order], dtype=np.float32)
+        actions = np.array([action_to_send.get(k, 0.0) for k in self._state_order], dtype=np.float32)
 
         action_sent = {key: actions[i] for i, key in enumerate(self._state_order)}
         action_sent["action"] = actions

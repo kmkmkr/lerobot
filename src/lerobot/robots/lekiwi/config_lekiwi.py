@@ -22,12 +22,12 @@ from ..config import RobotConfig
 
 def lekiwi_cameras_config() -> dict[str, CameraConfig]:
     return {
-        "front": OpenCVCameraConfig(
-            index_or_path="/dev/video0", fps=30, width=640, height=480, rotation=Cv2Rotation.ROTATE_180
-        ),
-        "wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video2", fps=30, width=480, height=640, rotation=Cv2Rotation.ROTATE_90
-        ),
+        # "front": OpenCVCameraConfig(
+        #     index_or_path="/dev/video0", fps=30, width=640, height=480, rotation=Cv2Rotation.ROTATE_180
+        # ),
+        # "wrist": OpenCVCameraConfig(
+        #     index_or_path="/dev/video2", fps=30, width=480, height=640, rotation=Cv2Rotation.ROTATE_90
+        # ),
     }
 
 
@@ -35,6 +35,8 @@ def lekiwi_cameras_config() -> dict[str, CameraConfig]:
 @dataclass
 class LeKiwiConfig(RobotConfig):
     port: str = "/dev/ttyACM0"  # port to connect to the bus
+    # Set to False when using only the 3-wheel mobile base (no follower arm motors on ids 1..6).
+    has_arm: bool = True
 
     disable_torque_on_disconnect: bool = True
 
@@ -55,8 +57,8 @@ class LeKiwiHostConfig:
     port_zmq_cmd: int = 5555
     port_zmq_observations: int = 5556
 
-    # Duration of the application
-    connection_time_s: int = 30
+    # Duration of the application. Set to None to run indefinitely.
+    connection_time_s: float | None = 30
 
     # Watchdog: stop the robot if no command is received for over 0.5 seconds.
     watchdog_timeout_ms: int = 500
@@ -70,6 +72,8 @@ class LeKiwiHostConfig:
 class LeKiwiClientConfig(RobotConfig):
     # Network Configuration
     remote_ip: str
+    # Set to False when the remote robot has only the mobile base and no follower arm.
+    has_arm: bool = True
     port_zmq_cmd: int = 5555
     port_zmq_observations: int = 5556
 

@@ -36,6 +36,16 @@ from .config_lekiwi import LeKiwiConfig
 
 logger = logging.getLogger(__name__)
 
+ARM_STATE_KEYS = (
+    "arm_shoulder_pan.pos",
+    "arm_shoulder_lift.pos",
+    "arm_elbow_flex.pos",
+    "arm_wrist_flex.pos",
+    "arm_wrist_roll.pos",
+    "arm_gripper.pos",
+)
+BASE_STATE_KEYS = ("x.vel", "y.vel", "theta.vel")
+
 
 class LeKiwi(Robot):
     """
@@ -51,10 +61,16 @@ class LeKiwi(Robot):
     def __init__(self, config: LeKiwiConfig):
         super().__init__(config)
         self.config = config
+        self.has_arm = config.has_arm
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
-        self.bus = FeetechMotorsBus(
-            port=self.config.port,
-            motors={
+        motors = {
+            # base
+            "base_left_wheel": Motor(7, "sts3215", MotorNormMode.RANGE_M100_100),
+            "base_back_wheel": Motor(8, "sts3215", MotorNormMode.RANGE_M100_100),
+            "base_right_wheel": Motor(9, "sts3215", MotorNormMode.RANGE_M100_100),
+        }
+        if self.has_arm:
+            motors = {
                 # arm
                 "arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
                 "arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
@@ -62,11 +78,11 @@ class LeKiwi(Robot):
                 "arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
                 "arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
                 "arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-                # base
-                "base_left_wheel": Motor(7, "sts3215", MotorNormMode.RANGE_M100_100),
-                "base_back_wheel": Motor(8, "sts3215", MotorNormMode.RANGE_M100_100),
-                "base_right_wheel": Motor(9, "sts3215", MotorNormMode.RANGE_M100_100),
-            },
+                **motors,
+            }
+        self.bus = FeetechMotorsBus(
+            port=self.config.port,
+            motors=motors,
             calibration=self.calibration,
         )
         self.arm_motors = [motor for motor in self.bus.motors if motor.startswith("arm")]
@@ -75,20 +91,8 @@ class LeKiwi(Robot):
 
     @property
     def _state_ft(self) -> dict[str, type]:
-        return dict.fromkeys(
-            (
-                "arm_shoulder_pan.pos",
-                "arm_shoulder_lift.pos",
-                "arm_elbow_flex.pos",
-                "arm_wrist_flex.pos",
-                "arm_wrist_roll.pos",
-                "arm_gripper.pos",
-                "x.vel",
-                "y.vel",
-                "theta.vel",
-            ),
-            float,
-        )
+        state_keys = (*ARM_STATE_KEYS, *BASE_STATE_KEYS) if self.has_arm else BASE_STATE_KEYS
+        return dict.fromkeys(state_keys, float)
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
@@ -113,7 +117,7 @@ class LeKiwi(Robot):
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
         self.bus.connect()
-        if not self.is_calibrated and calibrate:
+        if self.has_arm and not self.is_calibrated and calibrate:
             logger.info(
                 "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
             )
@@ -130,6 +134,10 @@ class LeKiwi(Robot):
         return self.bus.is_calibrated
 
     def calibrate(self) -> None:
+        if not self.has_arm:
+            logger.info("Skipping calibration because LeKiwi is configured without an arm.")
+            return
+
         if self.calibration:
             # Calibration file exists, ask user whether to use it or run new calibration
             user_input = input(
@@ -344,7 +352,7 @@ class LeKiwi(Robot):
 
         # Read actuators position for arm and vel for base
         start = time.perf_counter()
-        arm_pos = self.bus.sync_read("Present_Position", self.arm_motors)
+        arm_pos = self.bus.sync_read("Present_Position", self.arm_motors) if self.arm_motors else {}
         base_wheel_vel = self.bus.sync_read("Present_Velocity", self.base_motors)
 
         base_vel = self._wheel_raw_to_body(
@@ -386,7 +394,11 @@ class LeKiwi(Robot):
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         arm_goal_pos = {k: v for k, v in action.items() if k.endswith(".pos")}
-        base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
+        base_goal_vel = {
+            "x.vel": float(action.get("x.vel", 0.0)),
+            "y.vel": float(action.get("y.vel", 0.0)),
+            "theta.vel": float(action.get("theta.vel", 0.0)),
+        }
 
         base_wheel_goal_vel = self._body_to_wheel_raw(
             base_goal_vel["x.vel"], base_goal_vel["y.vel"], base_goal_vel["theta.vel"]
@@ -394,7 +406,7 @@ class LeKiwi(Robot):
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
-        if self.config.max_relative_target is not None:
+        if self.config.max_relative_target is not None and self.arm_motors and arm_goal_pos:
             present_pos = self.bus.sync_read("Present_Position", self.arm_motors)
             goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in arm_goal_pos.items()}
             arm_safe_goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
@@ -402,7 +414,8 @@ class LeKiwi(Robot):
 
         # Send goal position to the actuators
         arm_goal_pos_raw = {k.replace(".pos", ""): v for k, v in arm_goal_pos.items()}
-        self.bus.sync_write("Goal_Position", arm_goal_pos_raw)
+        if arm_goal_pos_raw:
+            self.bus.sync_write("Goal_Position", arm_goal_pos_raw)
         self.bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
 
         return {**arm_goal_pos, **base_goal_vel}
