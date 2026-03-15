@@ -27,6 +27,12 @@ First, install `lerobot` with the `async` tag, to install the extra dependencies
 pip install -e ".[async]"
 ```
 
+If you want to run async inference with LeKiwi, install the LeKiwi extras as well:
+
+```shell
+pip install -e ".[async,lekiwi]"
+```
+
 Then, spin up a policy server (in one terminal, or in a separate machine) specifying the host address and port for the client to connect to.
 You can spin up a policy server running:
 
@@ -61,6 +67,8 @@ In summary, you need to specify instructions for:
 - `ROBOT`: the type of robot to connect to, the port to connect to, and the local `id` of the robot
 - `POLICY`: the type of policy to run, and the model name/path on server to the checkpoint to run. You also need to specify which device should the sever be using, and how many actions to output at once (capped at the policy max actions value).
 - `CLIENT`: the threshold for the chunk size before sending a new observation to the server, and the function to aggregate actions on overlapping portions. Optionally, you can also visualize the queue size at runtime, to help you tune the `CLIENT` parameters.
+
+For LeKiwi, use `--robot.type=lekiwi` (onboard mode) or `--robot.type=lekiwi_client` (when controlling a remote `lekiwi_host`).
 
 Importantly,
 

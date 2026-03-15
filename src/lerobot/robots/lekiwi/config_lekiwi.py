@@ -35,6 +35,7 @@ def lekiwi_cameras_config() -> dict[str, CameraConfig]:
 @dataclass
 class LeKiwiConfig(RobotConfig):
     port: str = "/dev/ttyACM0"  # port to connect to the bus
+    has_arm: bool = True  # set to False to run LeKiwi as a base-only platform (wheel IDs stay 7,8,9)
 
     disable_torque_on_disconnect: bool = True
 
@@ -70,6 +71,7 @@ class LeKiwiHostConfig:
 class LeKiwiClientConfig(RobotConfig):
     # Network Configuration
     remote_ip: str
+    has_arm: bool = True  # should match the remote LeKiwi host configuration
     port_zmq_cmd: int = 5555
     port_zmq_observations: int = 5556
 

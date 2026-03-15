@@ -34,6 +34,15 @@ from .config_lekiwi import LeKiwiClientConfig
 class LeKiwiClient(Robot):
     config_class = LeKiwiClientConfig
     name = "lekiwi_client"
+    ARM_STATE_KEYS = (
+        "arm_shoulder_pan.pos",
+        "arm_shoulder_lift.pos",
+        "arm_elbow_flex.pos",
+        "arm_wrist_flex.pos",
+        "arm_wrist_roll.pos",
+        "arm_gripper.pos",
+    )
+    BASE_STATE_KEYS = ("x.vel", "y.vel", "theta.vel")
 
     def __init__(self, config: LeKiwiClientConfig):
         import zmq
@@ -49,6 +58,7 @@ class LeKiwiClient(Robot):
         self.port_zmq_observations = config.port_zmq_observations
 
         self.teleop_keys = config.teleop_keys
+        self.has_arm = config.has_arm
 
         self.polling_timeout_ms = config.polling_timeout_ms
         self.connect_timeout_s = config.connect_timeout_s
@@ -74,20 +84,8 @@ class LeKiwiClient(Robot):
 
     @cached_property
     def _state_ft(self) -> dict[str, type]:
-        return dict.fromkeys(
-            (
-                "arm_shoulder_pan.pos",
-                "arm_shoulder_lift.pos",
-                "arm_elbow_flex.pos",
-                "arm_wrist_flex.pos",
-                "arm_wrist_roll.pos",
-                "arm_gripper.pos",
-                "x.vel",
-                "y.vel",
-                "theta.vel",
-            ),
-            float,
-        )
+        state_keys = self.BASE_STATE_KEYS if not self.has_arm else (*self.ARM_STATE_KEYS, *self.BASE_STATE_KEYS)
+        return dict.fromkeys(state_keys, float)
 
     @cached_property
     def _state_order(self) -> tuple[str, ...]:

@@ -59,7 +59,7 @@ class LeKiwiHost:
 
 @draccus.wrap()
 def main(cfg: LeKiwiServerConfig):
-    logging.info("Configuring LeKiwi")
+    logging.info("Configuring LeKiwi (has_arm=%s)", cfg.robot.has_arm)
     robot = LeKiwi(cfg.robot)
 
     logging.info("Connecting LeKiwi")

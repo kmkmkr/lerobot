@@ -158,6 +158,16 @@ groot = [
 ]
 sarm = ["lerobot[transformers-dep]", "faker>=33.0.0,<35.0.0", "lerobot[matplotlib-dep]", "lerobot[qwen-vl-utils-dep]"]
 xvla = ["lerobot[transformers-dep]"]
+omnivla = [
+    "lerobot[transformers-dep]",
+    "lerobot[peft-dep]",
+    "lerobot[matplotlib-dep]",
+    "timm>=0.9.10,<1.1.0",
+    "sentencepiece>=0.1.99,<0.3.0",
+    "utm>=0.7.0,<1.0.0",
+    "safetensors>=0.4.3,<1.0.0",
+    "Pillow>=10.0.0,<13.0.0",
+]
 hilserl = ["lerobot[transformers-dep]", "gym-hil>=0.1.13,<0.2.0", "lerobot[grpcio-dep]", "lerobot[placo-dep]"]
 
 # Features

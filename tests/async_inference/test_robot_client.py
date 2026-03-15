@@ -260,6 +260,8 @@ def test_robot_client_registers_builtin_robot_types():
         "koch_follower",
         "omx_follower",
         "bi_so_follower",
+        "lekiwi",
+        "lekiwi_client",
     ]
     for robot_type in expected_robot_types:
         assert robot_type in known_choices, (

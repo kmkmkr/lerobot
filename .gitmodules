@@ -1,0 +1,3 @@
+[submodule "gitrepo/OmniVLA"]
+	path = gitrepo/OmniVLA
+	url = https://github.com/NHirose/OmniVLA.git
