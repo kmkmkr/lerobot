@@ -1,0 +1,1 @@
+uv sync --extra feetech --extra hilserl --extra async --extra pi --extra test

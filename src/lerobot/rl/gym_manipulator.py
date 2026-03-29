@@ -66,6 +66,7 @@ from lerobot.robots.so_follower.robot_kinematic_processor import (
     InverseKinematicsRLStep,
 )
 from lerobot.teleoperators import (
+    bi_so_leader_keyboard,  # noqa: F401
     gamepad,  # noqa: F401
     keyboard,  # noqa: F401
     make_teleoperator_from_config,
@@ -662,10 +663,13 @@ def control_loop(
     while episode_idx < cfg.dataset.num_episodes_to_record:
         step_start_time = time.perf_counter()
 
-        # Create a neutral action (no movement)
-        neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
-        if use_gripper:
-            neutral_action = torch.cat([neutral_action, torch.tensor([0.0])])  # Gripper stay
+        if cfg.env.processor.inverse_kinematics is None:
+            # In direct joint control modes, keep the current posture while idle.
+            neutral_action = transition[TransitionKey.OBSERVATION][OBS_STATE].squeeze(0).detach().cpu().float()
+        else:
+            neutral_action = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+            if use_gripper:
+                neutral_action = torch.cat([neutral_action, torch.tensor([0.0])])  # Gripper stay
 
         # Use the new step function
         transition = step_env_and_process_transition(

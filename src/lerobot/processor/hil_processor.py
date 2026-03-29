@@ -44,6 +44,25 @@ from .pipeline import (
 GRIPPER_KEY = "gripper"
 DISCRETE_PENALTY_KEY = "discrete_penalty"
 TELEOP_ACTION_KEY = "teleop_action"
+TELEOP_ACTION_NAMES_KEY = "teleop_action_names"
+
+
+def _extract_action_names(action_features: dict[str, Any] | None) -> list[str] | None:
+    """Infer an ordered action name list from teleoperator feature metadata."""
+    if not isinstance(action_features, dict):
+        return None
+
+    if "names" in action_features:
+        names = action_features["names"]
+        if isinstance(names, list):
+            return names
+        if isinstance(names, dict):
+            return [name for name, _ in sorted(names.items(), key=lambda item: item[1])]
+
+    if "dtype" not in action_features and "shape" not in action_features:
+        return list(action_features.keys())
+
+    return None
 
 
 @runtime_checkable
@@ -121,6 +140,9 @@ class AddTeleopActionAsComplimentaryDataStep(ComplementaryDataProcessorStep):
         """
         new_complementary_data = dict(complementary_data)
         new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
+        action_names = _extract_action_names(getattr(self.teleop_device, "action_features", None))
+        if action_names is not None:
+            new_complementary_data[TELEOP_ACTION_NAMES_KEY] = action_names
         return new_complementary_data
 
     def transform_features(
@@ -464,6 +486,7 @@ class InterventionActionProcessorStep(ProcessorStep):
         info = transition.get(TransitionKey.INFO, {})
         complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
         teleop_action = complementary_data.get(TELEOP_ACTION_KEY, {})
+        teleop_action_names = complementary_data.get(TELEOP_ACTION_NAMES_KEY)
         is_intervention = info.get(TeleopEvents.IS_INTERVENTION, False)
         terminate_episode = info.get(TeleopEvents.TERMINATE_EPISODE, False)
         success = info.get(TeleopEvents.SUCCESS, False)
@@ -474,14 +497,18 @@ class InterventionActionProcessorStep(ProcessorStep):
         # Override action if intervention is active
         if is_intervention and teleop_action is not None:
             if isinstance(teleop_action, dict):
-                # Convert teleop_action dict to tensor format
-                action_list = [
-                    teleop_action.get("delta_x", 0.0),
-                    teleop_action.get("delta_y", 0.0),
-                    teleop_action.get("delta_z", 0.0),
-                ]
-                if self.use_gripper:
-                    action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
+                # Backward compatible path for delta-ee teleops.
+                if {"delta_x", "delta_y", "delta_z"}.issubset(teleop_action):
+                    action_list = [
+                        teleop_action.get("delta_x", 0.0),
+                        teleop_action.get("delta_y", 0.0),
+                        teleop_action.get("delta_z", 0.0),
+                    ]
+                    if self.use_gripper:
+                        action_list.append(teleop_action.get(GRIPPER_KEY, 1.0))
+                else:
+                    ordered_names = teleop_action_names if teleop_action_names is not None else list(teleop_action)
+                    action_list = [teleop_action[name] for name in ordered_names]
             elif isinstance(teleop_action, np.ndarray):
                 action_list = teleop_action.tolist()
             else:

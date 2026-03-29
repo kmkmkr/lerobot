@@ -1,0 +1,165 @@
+{
+  "job_name": "bi_so_hilserl_joint_gorgeous_south_america_1",
+  "output_dir": "outputs/train/bi_so_hilserl_joint_gorgeous_south_america_1",
+  "seed": 1000,
+  "batch_size": 64,
+  "log_freq": 50,
+  "save_freq": 2000,
+  "wandb": {
+    "enable": false,
+    "project": "lerobot"
+  },
+  "dataset": {
+    "repo_id": "nkmurst/gorgeous_south_america_1_terminal_rl",
+    "root": "/home/sota.nakamura/.cache/huggingface/lerobot/nkmurst/gorgeous_south_america_1_terminal_rl"
+  },
+  "env": {
+    "type": "gym_manipulator",
+    "name": "real_robot",
+    "task": "gorgeous_south_america_1",
+    "fps": 24,
+    "features": {
+      "action": {
+        "type": "ACTION",
+        "shape": [12]
+      },
+      "observation.state": {
+        "type": "STATE",
+        "shape": [12]
+      },
+      "observation.images.left_top": {
+        "type": "VISUAL",
+        "shape": [480, 640, 3]
+      },
+      "observation.images.left_left": {
+        "type": "VISUAL",
+        "shape": [480, 640, 3]
+      },
+      "observation.images.left_right": {
+        "type": "VISUAL",
+        "shape": [480, 640, 3]
+      }
+    },
+    "features_map": {
+      "action": "action",
+      "observation.state": "observation.state",
+      "observation.images.left_top": "observation.images.left_top",
+      "observation.images.left_left": "observation.images.left_left",
+      "observation.images.left_right": "observation.images.left_right"
+    },
+    "robot": {
+      "type": "bi_so_follower",
+      "id": "bi_so_follower_main",
+      "left_arm_config": {
+        "port": "/dev/ttyACM_LEFT",
+        "use_degrees": true,
+        "cameras": {
+          "left_top": {
+            "type": "opencv",
+            "index_or_path": 0,
+            "fps": 24,
+            "width": 640,
+            "height": 480
+          },
+          "left_left": {
+            "type": "opencv",
+            "index_or_path": 1,
+            "fps": 24,
+            "width": 640,
+            "height": 480
+          },
+          "left_right": {
+            "type": "opencv",
+            "index_or_path": 2,
+            "fps": 24,
+            "width": 640,
+            "height": 480
+          }
+        }
+      },
+      "right_arm_config": {
+        "port": "/dev/ttyACM_RIGHT",
+        "use_degrees": true,
+        "cameras": {}
+      }
+    },
+    "teleop": {
+      "type": "bi_so_leader_keyboard",
+      "id": "bi_so_leader_keyboard_main",
+      "leader": {
+        "id": "bi_so_leader_main",
+        "left_arm_config": {
+          "port": "/dev/ttyACM_LEADER_LEFT",
+          "use_degrees": true
+        },
+        "right_arm_config": {
+          "port": "/dev/ttyACM_LEADER_RIGHT",
+          "use_degrees": true
+        }
+      },
+      "keyboard": {
+        "id": "hil_keyboard"
+      },
+      "intervention_key": " ",
+      "success_key": "s",
+      "failure_key": "q",
+      "rerecord_key": "r"
+    },
+    "processor": {
+      "control_mode": "leader",
+      "observation": {
+        "display_cameras": false
+      },
+      "image_preprocessing": {
+        "crop_params_dict": {},
+        "resize_size": null
+      },
+      "gripper": {
+        "use_gripper": true,
+        "gripper_penalty": 0.0
+      },
+      "reset": {
+        "fixed_reset_joint_positions": null,
+        "reset_time_s": 5.0,
+        "control_time_s": 20.0,
+        "terminate_on_success": true
+      },
+      "max_gripper_pos": 100.0
+    }
+  },
+  "policy": {
+    "type": "sac",
+    "device": "cuda",
+    "storage_device": "cuda",
+    "use_amp": true,
+    "push_to_hub": false,
+    "vision_encoder_name": "helper2424/resnet10",
+    "freeze_vision_encoder": true,
+    "shared_encoder": true,
+    "image_encoder_hidden_dim": 32,
+    "image_embedding_pooling_dim": 8,
+    "online_steps": 20000,
+    "online_buffer_capacity": 100000,
+    "offline_buffer_capacity": 100000,
+    "online_step_before_learning": 200,
+    "policy_update_freq": 1,
+    "discount": 0.99,
+    "temperature_init": 0.01,
+    "critic_lr": 0.0003,
+    "actor_lr": 0.0003,
+    "temperature_lr": 0.0003,
+    "critic_target_update_weight": 0.005,
+    "utd_ratio": 1,
+    "grad_clip_norm": 40.0,
+    "actor_learner_config": {
+      "learner_host": "127.0.0.1",
+      "learner_port": 50051,
+      "policy_parameters_push_frequency": 1,
+      "queue_get_timeout": 2.0
+    },
+    "concurrency": {
+      "actor": "threads",
+      "learner": "threads"
+    }
+  }
+}
