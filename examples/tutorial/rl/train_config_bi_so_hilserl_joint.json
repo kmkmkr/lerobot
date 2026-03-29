@@ -11,7 +11,7 @@
   },
   "dataset": {
     "repo_id": "nkmurst/gorgeous_south_america_1_terminal_rl",
-    "root": "/home/sota.nakamura/.cache/huggingface/lerobot/nkmurst/gorgeous_south_america_1_terminal_rl"
+    "root": null
   },
   "env": {
     "type": "gym_manipulator",
@@ -49,51 +49,54 @@
     },
     "robot": {
       "type": "bi_so_follower",
-      "id": "bi_so_follower_main",
+      "id": "bi_follower_arm",
       "left_arm_config": {
-        "port": "/dev/ttyACM_LEFT",
+        "port": "/dev/ttyACM1",
         "use_degrees": true,
         "cameras": {
-          "left_top": {
-            "type": "opencv",
-            "index_or_path": 0,
-            "fps": 24,
-            "width": 640,
-            "height": 480
-          },
-          "left_left": {
-            "type": "opencv",
-            "index_or_path": 1,
-            "fps": 24,
-            "width": 640,
-            "height": 480
-          },
-          "left_right": {
+          "top": {
             "type": "opencv",
             "index_or_path": 2,
             "fps": 24,
             "width": 640,
-            "height": 480
+            "height": 480,
+            "fourcc": "MJPG"
+          },
+          "left": {
+            "type": "opencv",
+            "index_or_path": 4,
+            "fps": 180,
+            "width": 640,
+            "height": 480,
+            "fourcc": "MJPG"
+          },
+          "right": {
+            "type": "opencv",
+            "index_or_path": 0,
+            "fps": 180,
+            "width": 640,
+            "height": 480,
+            "fourcc": "MJPG"
           }
         }
       },
       "right_arm_config": {
-        "port": "/dev/ttyACM_RIGHT",
+        "port": "/dev/ttyACM0",
         "use_degrees": true,
         "cameras": {}
       }
     },
     "teleop": {
       "type": "bi_so_leader_keyboard",
-      "id": "bi_so_leader_keyboard_main",
+      "id": "bi_so_leader_keyboard",
       "leader": {
-        "id": "bi_so_leader_main",
+        "id": "bi_leader_arm",
         "left_arm_config": {
-          "port": "/dev/ttyACM_LEADER_LEFT",
+          "port": "/dev/ttyACM2",
           "use_degrees": true
         },
         "right_arm_config": {
-          "port": "/dev/ttyACM_LEADER_RIGHT",
+          "port": "/dev/ttyACM3",
           "use_degrees": true
         }
       },
@@ -139,8 +142,9 @@
     "image_encoder_hidden_dim": 32,
     "image_embedding_pooling_dim": 8,
     "online_steps": 20000,
-    "online_buffer_capacity": 100000,
-    "offline_buffer_capacity": 100000,
+    "online_buffer_capacity": 5000,
+    "offline_buffer_capacity": 5000,
+    "lazy_offline_buffer": true,
     "online_step_before_learning": 200,
     "policy_update_freq": 1,
     "discount": 0.99,

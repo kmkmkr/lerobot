@@ -1,0 +1,38 @@
+Bootstrap: docker
+From: huggingface/lerobot-gpu
+
+%post
+    # Add Ubuntu 24.04 (noble) repository for FFmpeg 6
+    echo "deb http://archive.ubuntu.com/ubuntu noble main universe" > /etc/apt/sources.list.d/noble.list
+    echo "deb http://archive.ubuntu.com/ubuntu noble-updates main universe" >> /etc/apt/sources.list.d/noble.list
+
+    # Pin noble packages to low priority so only explicitly requested packages come from noble
+    printf 'Package: *\nPin: release n=noble\nPin-Priority: 100\n\nPackage: *\nPin: release n=noble-updates\nPin-Priority: 100\n' \
+        > /etc/apt/preferences.d/noble-pin
+
+    apt-get update
+
+    # Remove existing FFmpeg 4 packages to avoid conflicts
+    apt-get remove -y ffmpeg libavcodec58 libavformat58 libavutil56 \
+        libswscale5 libswresample3 libavdevice58 libavfilter7 || true
+    apt-get autoremove -y || true
+
+    # Install FFmpeg 6 from noble
+    apt-get install -y --no-install-recommends -t noble \
+        ffmpeg \
+        libavcodec60 \
+        libavdevice60 \
+        libavfilter9 \
+        libavformat60 \
+        libavutil58 \
+        libswresample4 \
+        libswscale7
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+%environment
+    export LC_ALL=C
+
+%labels
+    Author mkj
+    Description LeRobot GPU container with FFmpeg 6 for torchcodec

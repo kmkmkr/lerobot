@@ -48,6 +48,26 @@ except Exception as e:
     logging.info(f"Could not import pynput: {e}")
 
 
+def _has_x_record_extension() -> bool:
+    """Check if X11 RECORD extension is available for pynput on Linux."""
+    if "linux" not in sys.platform:
+        return True
+    if "DISPLAY" not in os.environ:
+        return False
+
+    try:
+        from Xlib import display as xdisplay
+
+        display = xdisplay.Display()
+        try:
+            return bool(display.has_extension("RECORD"))
+        finally:
+            display.close()
+    except Exception as exc:
+        logging.info(f"Unable to verify X RECORD extension. Skipping keyboard listener: {exc}")
+        return False
+
+
 class KeyboardTeleop(Teleoperator):
     """
     Teleop class to use keyboard inputs for control.
@@ -88,7 +108,7 @@ class KeyboardTeleop(Teleoperator):
 
     @check_if_already_connected
     def connect(self) -> None:
-        if PYNPUT_AVAILABLE:
+        if PYNPUT_AVAILABLE and _has_x_record_extension():
             logging.info("pynput is available - enabling local keyboard listener.")
             self.listener = keyboard.Listener(
                 on_press=self._on_press,
@@ -96,7 +116,10 @@ class KeyboardTeleop(Teleoperator):
             )
             self.listener.start()
         else:
-            logging.info("pynput not available - skipping local keyboard listener.")
+            if not PYNPUT_AVAILABLE:
+                logging.info("pynput not available - skipping local keyboard listener.")
+            else:
+                logging.info("X RECORD extension unavailable - skipping local keyboard listener.")
             self.listener = None
 
     def calibrate(self) -> None:

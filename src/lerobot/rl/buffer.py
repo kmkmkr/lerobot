@@ -832,3 +832,192 @@ def concatenate_batch_transitions(
                     left_info[key] = right_info[key]
 
     return left_batch_transitions
+
+
+class LazyReplayBuffer:
+    """A replay buffer that reads from a LeRobotDataset on-demand instead of pre-loading into RAM.
+
+    This provides the same sampling interface as ReplayBuffer (sample, get_iterator, __len__, add)
+    but stores only scalar metadata (rewards, dones, actions, episode indices) in memory and reads
+    image/state data lazily from the dataset when sampling. This dramatically reduces RAM usage
+    for image-heavy datasets.
+
+    Online transitions received from the actor are still stored in a small in-memory ReplayBuffer.
+    """
+
+    def __init__(
+        self,
+        dataset: LeRobotDataset,
+        state_keys: Sequence[str],
+        device: str = "cuda:0",
+        image_augmentation_function: Callable | None = None,
+        use_drq: bool = True,
+    ):
+        self.dataset = dataset
+        self.state_keys = list(state_keys)
+        self.device = device
+        self.num_frames = len(dataset)
+        self.use_drq = use_drq
+
+        if image_augmentation_function is None:
+            base_function = functools.partial(random_shift, pad=4)
+            self.image_augmentation_function = torch.compile(base_function)
+        else:
+            self.image_augmentation_function = image_augmentation_function
+
+        # Pre-compute episode boundaries for done/next_state logic
+        self._precompute_metadata()
+
+    def _precompute_metadata(self):
+        """Pre-compute lightweight metadata (episode_index per frame) for done inference."""
+        self._episode_indices = torch.empty(self.num_frames, dtype=torch.long)
+        self._has_done_key = DONE in self.dataset[0]
+
+        # Only load episode indices - very lightweight
+        for i in range(self.num_frames):
+            sample = self.dataset[i]
+            self._episode_indices[i] = sample["episode_index"]
+            if i > 0 and i % 5000 == 0:
+                import logging
+                logging.info(f"LazyReplayBuffer: indexed {i}/{self.num_frames} frames")
+
+    def __len__(self):
+        return self.num_frames
+
+    def _load_transition(self, idx: int) -> tuple[dict, dict, torch.Tensor, float, bool]:
+        """Load a single (state, next_state, action, reward, done) transition from the dataset."""
+        sample = self.dataset[idx]
+
+        state = {key: sample[key].unsqueeze(0) for key in self.state_keys}
+        action = sample[ACTION].unsqueeze(0)
+        reward = float(sample[REWARD].item())
+
+        # Done logic
+        if self._has_done_key:
+            done = bool(sample[DONE].item())
+        else:
+            done = (idx == self.num_frames - 1) or (
+                idx < self.num_frames - 1
+                and self._episode_indices[idx + 1] != self._episode_indices[idx]
+            )
+
+        # Next state
+        if not done and idx < self.num_frames - 1:
+            next_sample = self.dataset[idx + 1]
+            next_state = {key: next_sample[key].unsqueeze(0) for key in self.state_keys}
+        else:
+            next_state = state  # terminal: next_state = current_state
+
+        return state, next_state, action, reward, done
+
+    def sample(self, batch_size: int) -> BatchTransition:
+        """Sample a random batch by reading from the dataset on-demand."""
+        batch_size = min(batch_size, self.num_frames)
+        indices = torch.randint(0, self.num_frames, (batch_size,))
+
+        batch_states = {key: [] for key in self.state_keys}
+        batch_next_states = {key: [] for key in self.state_keys}
+        batch_actions = []
+        batch_rewards = []
+        batch_dones = []
+
+        for idx in indices.tolist():
+            state, next_state, action, reward, done = self._load_transition(idx)
+            for key in self.state_keys:
+                batch_states[key].append(state[key])
+                batch_next_states[key].append(next_state[key])
+            batch_actions.append(action)
+            batch_rewards.append(reward)
+            batch_dones.append(float(done))
+
+        # Stack into batched tensors
+        result_state = {key: torch.cat(batch_states[key], dim=0).to(self.device) for key in self.state_keys}
+        result_next_state = {
+            key: torch.cat(batch_next_states[key], dim=0).to(self.device) for key in self.state_keys
+        }
+        result_actions = torch.cat(batch_actions, dim=0).to(self.device)
+        result_rewards = torch.tensor(batch_rewards, device=self.device)
+        result_dones = torch.tensor(batch_dones, device=self.device)
+
+        # Apply DrQ image augmentation
+        image_keys = [k for k in self.state_keys if k.startswith(OBS_IMAGE)] if self.use_drq else []
+        if self.use_drq and image_keys:
+            all_images = []
+            for key in image_keys:
+                all_images.append(result_state[key])
+                all_images.append(result_next_state[key])
+            all_images_tensor = torch.cat(all_images, dim=0)
+            augmented_images = self.image_augmentation_function(all_images_tensor)
+            for i, key in enumerate(image_keys):
+                result_state[key] = augmented_images[i * 2 * batch_size : (i * 2 + 1) * batch_size]
+                result_next_state[key] = augmented_images[
+                    (i * 2 + 1) * batch_size : (i + 1) * 2 * batch_size
+                ]
+
+        return BatchTransition(
+            state=result_state,
+            action=result_actions,
+            reward=result_rewards,
+            next_state=result_next_state,
+            done=result_dones,
+            truncated=result_dones,
+            complementary_info=None,
+        )
+
+    def get_iterator(self, batch_size: int, async_prefetch: bool = True, queue_size: int = 2):
+        """Creates an infinite iterator that yields batches, same interface as ReplayBuffer."""
+        while True:
+            if async_prefetch:
+                yield from self._get_async_iterator(batch_size=batch_size, queue_size=queue_size)
+            else:
+                yield from self._get_naive_iterator(batch_size=batch_size, queue_size=queue_size)
+
+    def _get_async_iterator(self, batch_size: int, queue_size: int = 2):
+        import queue
+        import threading
+
+        data_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        shutdown_event = threading.Event()
+
+        def producer():
+            while not shutdown_event.is_set():
+                try:
+                    batch = self.sample(batch_size)
+                    data_queue.put(batch, block=True, timeout=0.5)
+                except queue.Full:
+                    continue
+                except Exception:
+                    shutdown_event.set()
+
+        producer_thread = threading.Thread(target=producer, daemon=True)
+        producer_thread.start()
+        try:
+            while not shutdown_event.is_set():
+                try:
+                    yield data_queue.get(block=True)
+                except Exception:
+                    if shutdown_event.is_set():
+                        break
+        finally:
+            shutdown_event.set()
+            while not data_queue.empty():
+                _ = data_queue.get_nowait()
+            producer_thread.join(timeout=1.0)
+
+    def _get_naive_iterator(self, batch_size: int, queue_size: int = 2):
+        import collections
+
+        q = collections.deque()
+
+        def enqueue(n):
+            for _ in range(n):
+                q.append(self.sample(batch_size))
+
+        enqueue(queue_size)
+        while q:
+            yield q.popleft()
+            enqueue(1)
+
+    def add(self, **kwargs):
+        """No-op for compatibility. LazyReplayBuffer is read-only from the dataset."""
+        pass

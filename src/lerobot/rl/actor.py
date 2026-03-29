@@ -427,7 +427,7 @@ def establish_learner_connection(
         # Force a connection attempt and check state
         try:
             logging.info("[ACTOR] Send ready message to Learner")
-            if stub.Ready(services_pb2.Empty()) == services_pb2.Empty():
+            if stub.Ready(services_pb2.Empty(), timeout=5) == services_pb2.Empty():
                 return True
         except grpc.RpcError as e:
             logging.error(f"[ACTOR] Waiting for Learner to be ready... {e}")

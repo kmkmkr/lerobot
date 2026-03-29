@@ -66,10 +66,10 @@ from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy
 from lerobot.policies.sac.modeling_sac import SACPolicy
-from lerobot.rl.buffer import ReplayBuffer, concatenate_batch_transitions
+from lerobot.rl.buffer import LazyReplayBuffer, ReplayBuffer, concatenate_batch_transitions
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.wandb_utils import WandBLogger
-from lerobot.robots import so_follower  # noqa: F401
+from lerobot.robots import bi_so_follower, so_follower  # noqa: F401
 from lerobot.teleoperators import bi_so_leader_keyboard, gamepad, so_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2_grpc
@@ -679,7 +679,7 @@ def save_training_checkpoint(
     policy: nn.Module,
     optimizers: dict[str, Optimizer],
     replay_buffer: ReplayBuffer,
-    offline_replay_buffer: ReplayBuffer | None = None,
+    offline_replay_buffer: ReplayBuffer | LazyReplayBuffer | None = None,
     dataset_repo_id: str | None = None,
     fps: int = 30,
 ) -> None:
@@ -744,7 +744,7 @@ def save_training_checkpoint(
     repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
     replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
 
-    if offline_replay_buffer is not None:
+    if offline_replay_buffer is not None and isinstance(offline_replay_buffer, ReplayBuffer):
         dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
         if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
             shutil.rmtree(dataset_offline_dir)
@@ -976,7 +976,7 @@ def initialize_offline_replay_buffer(
     cfg: TrainRLServerPipelineConfig,
     device: str,
     storage_device: str,
-) -> ReplayBuffer:
+) -> ReplayBuffer | LazyReplayBuffer:
     """
     Initialize an offline replay buffer from a dataset.
 
@@ -986,7 +986,7 @@ def initialize_offline_replay_buffer(
         storage_device (str): Device for storage optimization
 
     Returns:
-        ReplayBuffer: Initialized offline replay buffer
+        ReplayBuffer | LazyReplayBuffer: Initialized offline replay buffer
     """
     if not cfg.resume:
         logging.info("make_dataset offline buffer")
@@ -999,6 +999,28 @@ def initialize_offline_replay_buffer(
             root=dataset_offline_path,
         )
 
+    # Apply image resize to match the processor's resize_size used by the actor,
+    # ensuring consistency between offline and online buffer image dimensions.
+    resize_size = _get_processor_resize_size(cfg)
+    if resize_size is not None:
+        from torchvision.transforms import v2 as transforms
+
+        resize_transform = transforms.Resize(resize_size, antialias=True)
+        offline_dataset.image_transforms = resize_transform
+        # Also update the already-created reader so __getitem__ uses the resize
+        if hasattr(offline_dataset, "reader") and offline_dataset.reader is not None:
+            offline_dataset.reader._image_transforms = resize_transform
+        logging.info(f"Applying resize {resize_size} to offline dataset images")
+
+    # Use lazy loading if configured (reads from disk per batch, no RAM pre-load)
+    if getattr(cfg.policy, "lazy_offline_buffer", False):
+        logging.info("Using LazyReplayBuffer for offline data (disk-backed, low RAM usage)")
+        return LazyReplayBuffer(
+            dataset=offline_dataset,
+            state_keys=cfg.policy.input_features.keys(),
+            device=device,
+        )
+
     logging.info("Convert to a offline replay buffer")
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
@@ -1009,6 +1031,19 @@ def initialize_offline_replay_buffer(
         capacity=cfg.policy.offline_buffer_capacity,
     )
     return offline_replay_buffer
+
+
+def _get_processor_resize_size(cfg: TrainRLServerPipelineConfig) -> tuple[int, int] | None:
+    """Extract resize_size from the processor's image_preprocessing config, if set."""
+    if cfg.env is None:
+        return None
+    processor = getattr(cfg.env, "processor", None)
+    if processor is None:
+        return None
+    image_preprocessing = getattr(processor, "image_preprocessing", None)
+    if image_preprocessing is None:
+        return None
+    return getattr(image_preprocessing, "resize_size", None)
 
 
 # Utilities/Helpers functions
@@ -1126,7 +1161,7 @@ def process_interaction_message(
 def process_transitions(
     transition_queue: Queue,
     replay_buffer: ReplayBuffer,
-    offline_replay_buffer: ReplayBuffer,
+    offline_replay_buffer: ReplayBuffer | LazyReplayBuffer,
     device: str,
     dataset_repo_id: str | None,
     shutdown_event: any,

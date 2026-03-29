@@ -78,7 +78,9 @@ class BiSOLeaderKeyboardTeleop(Teleoperator):
 
     @property
     def is_connected(self) -> bool:
-        return self.leader.is_connected and self.keyboard.is_connected
+        # Keep teleoperation available even when the optional keyboard listener
+        # is unavailable (e.g. headless/X11 RECORD extension missing).
+        return self.leader.is_connected
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
@@ -103,7 +105,10 @@ class BiSOLeaderKeyboardTeleop(Teleoperator):
 
     @check_if_not_connected
     def get_teleop_events(self) -> dict[str, Any]:
-        pressed_keys = set(self.keyboard.get_action().keys())
+        if self.keyboard.is_connected:
+            pressed_keys = set(self.keyboard.get_action().keys())
+        else:
+            pressed_keys = set()
         new_presses = pressed_keys - self._pressed_keys
         self._pressed_keys = pressed_keys
 
@@ -126,5 +131,6 @@ class BiSOLeaderKeyboardTeleop(Teleoperator):
 
     @check_if_not_connected
     def disconnect(self) -> None:
-        self.keyboard.disconnect()
+        if self.keyboard.is_connected:
+            self.keyboard.disconnect()
         self.leader.disconnect()

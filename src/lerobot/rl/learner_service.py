@@ -23,7 +23,7 @@ from lerobot.rl.queue import get_last_item_from_queue
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import receive_bytes_in_chunks, send_bytes_in_chunks
 
-MAX_WORKERS = 3  # Stream parameters, send transitions and interactions
+MAX_WORKERS = 5  # Stream parameters, send transitions, interactions + headroom for Ready/reconnections
 SHUTDOWN_TIMEOUT = 10
 
 
@@ -56,13 +56,17 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
 
         last_push_time = 0
 
-        while not self.shutdown_event.is_set():
+        while not self.shutdown_event.is_set() and context.is_active():
             time_since_last_push = time.time() - last_push_time
             if time_since_last_push < self.seconds_between_pushes:
                 self.shutdown_event.wait(self.seconds_between_pushes - time_since_last_push)
                 # Continue, because we could receive a shutdown event,
                 # and it's checked in the while loop
                 continue
+
+            # Check if the actor is still connected before attempting to push
+            if not context.is_active():
+                break
 
             logging.info("[LEARNER] Push parameters to the Actor")
             buffer = get_last_item_from_queue(
@@ -82,7 +86,7 @@ class LearnerService(services_pb2_grpc.LearnerServiceServicer):
             last_push_time = time.time()
             logging.info("[LEARNER] Parameters sent")
 
-        logging.info("[LEARNER] Stream parameters finished")
+        logging.info("[LEARNER] Stream parameters finished (actor disconnected or shutdown)")
         return services_pb2.Empty()
 
     def SendTransitions(self, request_iterator, _context):  # noqa: N802

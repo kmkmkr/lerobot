@@ -143,6 +143,8 @@ class SACConfig(PreTrainedConfig):
     online_buffer_capacity: int = 100000
     # Capacity of the offline replay buffer
     offline_buffer_capacity: int = 100000
+    # Use lazy loading for the offline buffer (reads from disk per batch instead of pre-loading into RAM)
+    lazy_offline_buffer: bool = False
     # Whether to use asynchronous prefetching for the buffers
     async_prefetch: bool = False
     # Number of steps before learning starts

@@ -54,6 +54,7 @@ from lerobot.processor import (
 from lerobot.processor.converters import identity_transition
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
+    bi_so_follower,
     make_robot_from_config,
     so_follower,
 )
@@ -83,6 +84,32 @@ from .joint_observations_processor import JointVelocityProcessorStep, MotorCurre
 logging.basicConfig(level=logging.INFO)
 
 
+def _get_motor_names(robot: Robot) -> list[str]:
+    """Infer motor names for both single-arm robots and composed robots (e.g. bimanual)."""
+    if hasattr(robot, "bus") and hasattr(robot.bus, "motors"):  # type: ignore[attr-defined]
+        return list(robot.bus.motors.keys())  # type: ignore[attr-defined]
+
+    action_features = getattr(robot, "action_features", {})
+    if isinstance(action_features, dict):
+        motor_names = [
+            key.removesuffix(".pos")
+            for key in action_features
+            if isinstance(key, str) and key.endswith(".pos")
+        ]
+        if motor_names:
+            return motor_names
+
+    raise AttributeError(
+        f"Unable to infer motor names for robot type '{type(robot).__name__}'. "
+        "Expected either robot.bus.motors or action feature keys ending with '.pos'."
+    )
+
+
+def _infer_image_keys(obs_dict: RobotObservation) -> list[str]:
+    """Infer camera keys from observation dictionary keys."""
+    return [key for key in obs_dict if isinstance(key, str) and not key.endswith(".pos")]
+
+
 @dataclass
 class DatasetConfig:
     """Configuration for dataset creation and management."""
@@ -107,16 +134,24 @@ class GymManipulatorConfig:
 
 def reset_follower_position(robot_arm: Robot, target_position: np.ndarray) -> None:
     """Reset robot arm to target position using smooth trajectory."""
-    current_position_dict = robot_arm.bus.sync_read("Present_Position")
-    current_position = np.array(
-        [current_position_dict[name] for name in current_position_dict], dtype=np.float32
-    )
-    trajectory = torch.from_numpy(
-        np.linspace(current_position, target_position, 50)
-    )  # NOTE: 30 is just an arbitrary number
+    motor_names = _get_motor_names(robot_arm)
+
+    if hasattr(robot_arm, "bus") and hasattr(robot_arm.bus, "sync_read"):  # type: ignore[attr-defined]
+        current_position_dict = robot_arm.bus.sync_read("Present_Position")  # type: ignore[attr-defined]
+        current_position = np.array([current_position_dict[name] for name in motor_names], dtype=np.float32)
+        trajectory = torch.from_numpy(np.linspace(current_position, target_position, 50))
+        for pose in trajectory:
+            action_dict = dict(zip(motor_names, pose, strict=False))
+            robot_arm.bus.sync_write("Goal_Position", action_dict)  # type: ignore[attr-defined]
+            precise_sleep(0.015)
+        return
+
+    observation = robot_arm.get_observation()
+    current_position = np.array([observation[f"{name}.pos"] for name in motor_names], dtype=np.float32)
+    trajectory = torch.from_numpy(np.linspace(current_position, target_position, 50))
     for pose in trajectory:
-        action_dict = dict(zip(current_position_dict, pose, strict=False))
-        robot_arm.bus.sync_write("Goal_Position", action_dict)
+        action_dict = {f"{name}.pos": float(value) for name, value in zip(motor_names, pose, strict=False)}
+        robot_arm.send_action(action_dict)
         precise_sleep(0.015)
 
 
@@ -153,15 +188,25 @@ class RobotEnv(gym.Env):
         self.current_step = 0
         self.episode_data = None
 
-        self._joint_names = [f"{key}.pos" for key in self.robot.bus.motors]
-        self._image_keys = self.robot.cameras.keys()
-
         self.reset_pose = reset_pose
         self.reset_time_s = reset_time_s
 
         self.use_gripper = use_gripper
 
-        self._joint_names = list(self.robot.bus.motors.keys())
+        self._joint_names = _get_motor_names(self.robot)
+        if self.use_gripper:
+            self._controlled_joint_names = list(self._joint_names)
+        else:
+            self._controlled_joint_names = [
+                joint_name for joint_name in self._joint_names if not joint_name.endswith("gripper")
+            ]
+        if not self._controlled_joint_names:
+            raise ValueError("No controllable joints found. Check robot action features and gripper settings.")
+
+        # Infer image keys from the concrete observation format. This supports
+        # prefixed camera names such as left_top/right_top in bimanual robots.
+        self._image_keys = _infer_image_keys(self.robot.get_observation())
+
         self._raw_joint_positions = None
 
         self._setup_spaces()
@@ -171,8 +216,7 @@ class RobotEnv(gym.Env):
         obs_dict = self.robot.get_observation()
         raw_joint_joint_position = {f"{name}.pos": obs_dict[f"{name}.pos"] for name in self._joint_names}
         joint_positions = np.array([raw_joint_joint_position[f"{name}.pos"] for name in self._joint_names])
-
-        images = {key: obs_dict[key] for key in self._image_keys}
+        images = {key: obs_dict[key] for key in self._image_keys if key in obs_dict}
 
         return {"agent_pos": joint_positions, "pixels": images, **raw_joint_joint_position}
 
@@ -204,15 +248,10 @@ class RobotEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(observation_spaces)
 
         # Define the action space for joint positions along with setting an intervention flag.
-        action_dim = 3
+        action_dim = len(self._controlled_joint_names)
         bounds = {}
         bounds["min"] = -np.ones(action_dim)
         bounds["max"] = np.ones(action_dim)
-
-        if self.use_gripper:
-            action_dim += 1
-            bounds["min"] = np.concatenate([bounds["min"], [0]])
-            bounds["max"] = np.concatenate([bounds["max"], [2]])
 
         self.action_space = gym.spaces.Box(
             low=bounds["min"],
@@ -254,7 +293,19 @@ class RobotEnv(gym.Env):
 
     def step(self, action) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
         """Execute one environment step with given action."""
-        joint_targets_dict = {f"{key}.pos": action[i] for i, key in enumerate(self.robot.bus.motors.keys())}
+        if isinstance(action, torch.Tensor):
+            action_array = action.detach().cpu().numpy().astype(np.float32, copy=False).reshape(-1)
+        else:
+            action_array = np.asarray(action, dtype=np.float32).reshape(-1)
+
+        if action_array.shape[0] != len(self._controlled_joint_names):
+            raise ValueError(
+                f"Action dimension mismatch: expected {len(self._controlled_joint_names)}, got {action_array.shape[0]}."
+            )
+
+        joint_targets_dict = {
+            f"{key}.pos": float(action_array[i]) for i, key in enumerate(self._controlled_joint_names)
+        }
 
         self.robot.send_action(joint_targets_dict)
 
@@ -396,7 +447,7 @@ def make_processors(
 
     # Full processor pipeline for real robot environment
     # Get robot and motor information for kinematics
-    motor_names = list(env.robot.bus.motors.keys())
+    motor_names = _get_motor_names(env.robot)
 
     # Set up kinematics solver if inverse kinematics is configured
     kinematics_solver = None
