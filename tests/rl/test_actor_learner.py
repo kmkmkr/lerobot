@@ -17,11 +17,13 @@
 import socket
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import torch
 from torch.multiprocessing import Event, Queue
 
+from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainRLServerPipelineConfig
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.utils.constants import OBS_STR
@@ -86,6 +88,28 @@ def cfg():
     cfg.policy = policy_cfg
 
     return cfg
+
+
+def test_train_config_rejects_existing_output_dir_by_default(tmp_path):
+    cfg = TrainRLServerPipelineConfig(
+        dataset=DatasetConfig(repo_id="test/repo"),
+        policy=SACConfig(push_to_hub=False),
+        output_dir=tmp_path,
+    )
+
+    with pytest.raises(FileExistsError):
+        cfg.validate()
+
+
+def test_train_config_allows_existing_output_dir_when_requested(tmp_path):
+    cfg = TrainRLServerPipelineConfig(
+        dataset=DatasetConfig(repo_id="test/repo"),
+        policy=SACConfig(push_to_hub=False),
+        output_dir=Path(tmp_path),
+    )
+
+    cfg.validate(allow_existing_output_dir=True)
+    assert cfg.output_dir == Path(tmp_path)
 
 
 @require_package("grpcio", "grpc")

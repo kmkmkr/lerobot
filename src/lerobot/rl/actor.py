@@ -64,7 +64,7 @@ from lerobot.policies.factory import make_policy
 from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.rl.process import ProcessSignalHandler
 from lerobot.rl.queue import get_last_item_from_queue
-from lerobot.robots import so_follower  # noqa: F401
+from lerobot.robots import bi_so_follower, so_follower  # noqa: F401
 from lerobot.teleoperators import bi_so_leader_keyboard, gamepad, so_leader  # noqa: F401
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.transport import services_pb2, services_pb2_grpc
@@ -102,7 +102,8 @@ from .gym_manipulator import (
 
 @parser.wrap()
 def actor_cli(cfg: TrainRLServerPipelineConfig):
-    cfg.validate()
+    # The actor is expected to attach to the learner's run directory for shared logs/checkpoints.
+    cfg.validate(allow_existing_output_dir=True)
     display_pid = False
     if not use_threads(cfg):
         import torch.multiprocessing as mp
