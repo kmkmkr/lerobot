@@ -1,0 +1,1 @@
+singularity build --fakeroot lerobot-gpu.sif lerobot-gpu.def
