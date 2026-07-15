@@ -28,6 +28,7 @@ poetry.lock
 Pipfile.lock
 
 ### Build & Distribution ###
+*.sif
 build/
 dist/
 sdist/

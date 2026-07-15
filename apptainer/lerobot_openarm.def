@@ -1,0 +1,93 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-base-ubuntu24.04
+
+%labels
+    Author LeRobot
+    Description "LeRobot OpenArm runtime with CUDA, CAN tooling, ffmpeg, and uv"
+
+%environment
+    export DEBIAN_FRONTEND=noninteractive
+    export MUJOCO_GL=egl
+    export PYTHONDONTWRITEBYTECODE=1
+    export UV_LINK_MODE=copy
+    export UV_PROJECT_ENVIRONMENT=/workspace/lerobot/.venv
+    export PATH=/workspace/lerobot/.venv/bin:/usr/local/bin:$PATH
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        can-utils \
+        cmake \
+        curl \
+        ffmpeg \
+        git \
+        gnupg \
+        iproute2 \
+        kmod \
+        libegl1 \
+        libegl1-mesa-dev \
+        libgeos-dev \
+        libgl1 \
+        libglib2.0-0 \
+        libvulkan1 \
+        mesa-vulkan-drivers \
+        libx11-xcb1 \
+        libxcb-cursor0 \
+        libxcb-icccm4 \
+        libxcb-image0 \
+        libxcb-keysyms1 \
+        libxcb-randr0 \
+        libxcb-render-util0 \
+        libxcb-shape0 \
+        libxcb-xfixes0 \
+        libxcb-xkb1 \
+        libxcursor1 \
+        libxi6 \
+        libxinerama1 \
+        libxkbcommon-x11-0 \
+        libxrandr2 \
+        libusb-1.0-0-dev \
+        lsb-release \
+        ninja-build \
+        pciutils \
+        pkg-config \
+        portaudio19-dev \
+        python3-launchpadlib \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+        software-properties-common \
+        speech-dispatcher \
+        sudo \
+        usbutils \
+        v4l-utils
+
+    add-apt-repository -y universe
+    add-apt-repository -y ppa:openarm/main
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        libopenarm-can-dev \
+        openarm-can-utils
+
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    install -m 0755 /root/.local/bin/uv /usr/local/bin/uv
+    if [ -f /root/.local/bin/uvx ]; then
+        install -m 0755 /root/.local/bin/uvx /usr/local/bin/uvx
+    fi
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+
+    mkdir -p /workspace/lerobot
+    apt-get clean
+    rm -rf /var/lib/apt/lists/* /root/.cache /root/.local
+
+%runscript
+    if [ "$#" -eq 0 ]; then
+        exec /bin/bash
+    fi
+    exec "$@"
