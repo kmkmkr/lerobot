@@ -67,19 +67,38 @@ Follow our [Installation Guide](./installation), then install the Damiao motor s
 pip install -e ".[damiao]"
 ```
 
+## OpenArm v1 Motor-Zero Calibration
+
+OpenArm v1 and v1.1 use the zero stored in each Damiao motor as their joint coordinate frame.
+Stop every controller, support the arm safely, and run the
+[official OpenArm zero-position calibration](https://docs.openarm.dev/software/setup/motor-config/)
+for one arm at a time:
+
+```bash
+openarm-can-zero-position-calibration --canport can0 --arm-side right_arm
+openarm-can-zero-position-calibration --canport can1 --arm-side left_arm
+```
+
+The procedure moves joints against their mechanical references. Verify the CAN port and arm side
+before running it. LeRobot treats the resulting `openarm_v1_motor_zero` angles (in degrees) as the
+canonical coordinate frame. It never rewrites motor zero during `connect()`.
+
+<Tip warning={true}>
+  Do not run `lerobot-calibrate` for a full-size OpenArm v1 follower or leader. LeRobot rejects that
+  command because setting an arbitrary current pose to zero makes collected data, joint limits, and
+  deployment commands use different coordinates. Legacy LeRobot OpenArm calibration JSON files are
+  ignored.
+</Tip>
+
 ## Usage
 
 ### Follower Arm (Robot)
 
 <hfoptions id="follower">
-<hfoption id="Command">
+<hfoption id="Zero calibration">
 
 ```bash
-lerobot-calibrate \
-    --robot.type=openarm_follower \
-    --robot.port=can0 \
-    --robot.side=right \
-    --robot.id=my_openarm_follower
+openarm-can-zero-position-calibration --canport can0 --arm-side right_arm
 ```
 
 </hfoption>
@@ -125,13 +144,10 @@ follower.disconnect()
 The leader arm is used for teleoperation - manually moving it to control the follower arm.
 
 <hfoptions id="leader">
-<hfoption id="Command">
+<hfoption id="Zero calibration">
 
 ```bash
-lerobot-calibrate \
-    --teleop.type=openarm_leader \
-    --teleop.port=can1 \
-    --teleop.id=my_openarm_leader
+openarm-can-zero-position-calibration --canport can1 --arm-side left_arm
 ```
 
 </hfoption>
@@ -218,6 +234,8 @@ lerobot-record \
 | --------------------- | --------- | ---------------------------------------------------------- |
 | `port`                | -         | CAN interface (e.g., `can0`)                               |
 | `side`                | `None`    | Arm side: `"left"`, `"right"`, or `None` for custom limits |
+| `coordinate_frame`    | `openarm_v1_motor_zero` | Official OpenArm v1 motor-zero frame (degrees) |
+| `joint_limits`        | Side-specific | Conservative limits, validated inside v1 physical limits |
 | `use_can_fd`          | `True`    | Enable CAN FD for higher data rates                        |
 | `can_bitrate`         | `1000000` | Nominal bitrate (1 Mbps)                                   |
 | `can_data_bitrate`    | `5000000` | CAN FD data bitrate (5 Mbps)                               |

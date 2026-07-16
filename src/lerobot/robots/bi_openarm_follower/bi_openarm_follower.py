@@ -54,13 +54,14 @@ class BiOpenArmFollower(BimanualMixin, Robot):
 
         left_arm_config = OpenArmFollowerConfig(
             id=f"{config.id}_left" if config.id else None,
-            calibration_dir=config.calibration_dir,
+            calibration_dir=self.calibration_dir,
             port=config.left_arm_config.port,
             disable_torque_on_disconnect=config.left_arm_config.disable_torque_on_disconnect,
             use_velocity_and_torque=config.left_arm_config.use_velocity_and_torque,
             max_relative_target=config.left_arm_config.max_relative_target,
             cameras=left_arm_cameras,
             side=config.left_arm_config.side,
+            coordinate_frame=config.left_arm_config.coordinate_frame,
             can_interface=config.left_arm_config.can_interface,
             use_can_fd=config.left_arm_config.use_can_fd,
             can_bitrate=config.left_arm_config.can_bitrate,
@@ -73,13 +74,14 @@ class BiOpenArmFollower(BimanualMixin, Robot):
 
         right_arm_config = OpenArmFollowerConfig(
             id=f"{config.id}_right" if config.id else None,
-            calibration_dir=config.calibration_dir,
+            calibration_dir=self.calibration_dir,
             port=config.right_arm_config.port,
             disable_torque_on_disconnect=config.right_arm_config.disable_torque_on_disconnect,
             use_velocity_and_torque=config.right_arm_config.use_velocity_and_torque,
             max_relative_target=config.right_arm_config.max_relative_target,
             cameras=config.right_arm_config.cameras,
             side=config.right_arm_config.side,
+            coordinate_frame=config.right_arm_config.coordinate_frame,
             can_interface=config.right_arm_config.can_interface,
             use_can_fd=config.right_arm_config.use_can_fd,
             can_bitrate=config.right_arm_config.can_bitrate,

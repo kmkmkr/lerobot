@@ -14,7 +14,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_openarm_follower import OpenArmFollowerConfig, OpenArmFollowerConfigBase
+from .config_openarm_follower import (
+    OPENARM_V1_CALIBRATION_METHOD,
+    OPENARM_V1_COORDINATE_FRAME,
+    OPENARM_V1_DESCRIPTION_PROFILE,
+    OPENARM_V1_DESCRIPTION_REF,
+    OPENARM_V1_HARDWARE_VERSION,
+    OPENARM_V1_PHYSICAL_JOINT_LIMITS,
+    OPENARM_V1_SAFE_JOINT_LIMITS,
+    OpenArmFollowerConfig,
+    OpenArmFollowerConfigBase,
+)
 from .openarm_follower import OpenArmFollower
 
-__all__ = ["OpenArmFollower", "OpenArmFollowerConfig", "OpenArmFollowerConfigBase"]
+__all__ = [
+    "OPENARM_V1_CALIBRATION_METHOD",
+    "OPENARM_V1_COORDINATE_FRAME",
+    "OPENARM_V1_DESCRIPTION_PROFILE",
+    "OPENARM_V1_DESCRIPTION_REF",
+    "OPENARM_V1_HARDWARE_VERSION",
+    "OPENARM_V1_PHYSICAL_JOINT_LIMITS",
+    "OPENARM_V1_SAFE_JOINT_LIMITS",
+    "OpenArmFollower",
+    "OpenArmFollowerConfig",
+    "OpenArmFollowerConfigBase",
+]

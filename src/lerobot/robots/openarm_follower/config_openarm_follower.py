@@ -20,6 +20,40 @@ from lerobot.cameras import CameraConfig
 
 from ..config import RobotConfig
 
+OPENARM_V1_HARDWARE_VERSION = "1.1"
+OPENARM_V1_DESCRIPTION_PROFILE = "v10"
+OPENARM_V1_DESCRIPTION_REF = "1.0.4"
+OPENARM_V1_COORDINATE_FRAME = "openarm_v1_motor_zero"
+OPENARM_V1_CALIBRATION_METHOD = "openarm_can_zero_position"
+
+# Limits in the OpenArm v1 v10 description, expressed in motor-zero degrees.
+# Source: openarm_description 1.0.4, config/arm/v10/joint_limits.yaml.
+OPENARM_V1_PHYSICAL_JOINT_LIMITS: dict[str, dict[str, tuple[float, float]]] = {
+    "left": {
+        "joint_1": (-200.0, 80.0),
+        "joint_2": (-190.0, 10.0),
+        "joint_3": (-90.0, 90.0),
+        "joint_4": (0.0, 140.0),
+        "joint_5": (-90.0, 90.0),
+        "joint_6": (-45.0, 45.0),
+        "joint_7": (-90.0, 90.0),
+        "gripper": (-60.0, 0.0),
+    },
+    "right": {
+        "joint_1": (-80.0, 200.0),
+        "joint_2": (-10.0, 190.0),
+        "joint_3": (-90.0, 90.0),
+        "joint_4": (0.0, 140.0),
+        "joint_5": (-90.0, 90.0),
+        "joint_6": (-45.0, 45.0),
+        "joint_7": (-90.0, 90.0),
+        "gripper": (-60.0, 0.0),
+    },
+}
+
+# Conservative deployment limits. These deliberately remain inside the v1
+# physical limits. They are also consumed by the OpenArmDataset converter so
+# collection and deployment are audited against the same coordinate contract.
 LEFT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
     "joint_1": (-75.0, 75.0),
     "joint_2": (-90.0, 9.0),
@@ -28,7 +62,7 @@ LEFT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
     "joint_5": (-85.0, 85.0),
     "joint_6": (-40.0, 40.0),
     "joint_7": (-80.0, 80.0),
-    "gripper": (-65.0, 0.0),
+    "gripper": (-60.0, 0.0),
 }
 
 RIGHT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
@@ -39,7 +73,23 @@ RIGHT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
     "joint_5": (-85.0, 85.0),
     "joint_6": (-40.0, 40.0),
     "joint_7": (-80.0, 80.0),
-    "gripper": (-65.0, 0.0),
+    "gripper": (-60.0, 0.0),
+}
+
+OPENARM_V1_SAFE_JOINT_LIMITS: dict[str, dict[str, tuple[float, float]]] = {
+    "left": LEFT_DEFAULT_JOINTS_LIMITS,
+    "right": RIGHT_DEFAULT_JOINTS_LIMITS,
+}
+
+OPENARM_FALLBACK_JOINT_LIMITS: dict[str, tuple[float, float]] = {
+    "joint_1": (-5.0, 5.0),
+    "joint_2": (-5.0, 5.0),
+    "joint_3": (-5.0, 5.0),
+    "joint_4": (0.0, 5.0),
+    "joint_5": (-5.0, 5.0),
+    "joint_6": (-5.0, 5.0),
+    "joint_7": (-5.0, 5.0),
+    "gripper": (-5.0, 0.0),
 }
 
 
@@ -54,6 +104,10 @@ class OpenArmFollowerConfigBase:
 
     # side of the arm: "left" or "right". If "None" default values will be used
     side: str | None = None
+
+    # OpenArm v1 positions are raw motor angles relative to the zero written by
+    # the official openarm-can zero-position calibration tool.
+    coordinate_frame: str = OPENARM_V1_COORDINATE_FRAME
 
     # CAN interface type: "socketcan" (Linux), "slcan" (serial), or "auto" (auto-detect)
     can_interface: str = "socketcan"
@@ -104,20 +158,10 @@ class OpenArmFollowerConfigBase:
     )
     position_kd: list[float] = field(default_factory=lambda: [5.0, 5.0, 3.0, 5.0, 0.3, 0.3, 0.3, 0.3])
 
-    # Values for joint limits. Can be overridden via CLI (for custom values) or by setting config.side to either 'left' or 'right'.
-    # If config.side is left set to None and no CLI values are passed, the default joint limit values are small for safety.
-    joint_limits: dict[str, tuple[float, float]] = field(
-        default_factory=lambda: {
-            "joint_1": (-5.0, 5.0),
-            "joint_2": (-5.0, 5.0),
-            "joint_3": (-5.0, 5.0),
-            "joint_4": (0.0, 5.0),
-            "joint_5": (-5.0, 5.0),
-            "joint_6": (-5.0, 5.0),
-            "joint_7": (-5.0, 5.0),
-            "gripper": (-5.0, 0.0),
-        }
-    )
+    # Values for joint limits. When omitted, side-specific conservative v1
+    # limits are selected. Explicit values are preserved and validated instead
+    # of being silently overwritten when ``side`` is set.
+    joint_limits: dict[str, tuple[float, float]] | None = None
 
 
 @RobotConfig.register_subclass("openarm_follower")

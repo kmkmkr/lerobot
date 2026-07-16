@@ -18,8 +18,9 @@ import logging
 import time
 from typing import Any
 
-from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
+from lerobot.robots.openarm_follower import OPENARM_V1_COORDINATE_FRAME
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -54,10 +55,17 @@ class OpenArmLeader(Teleoperator):
             motor.motor_type_str = motor_type_str
             motors[motor_name] = motor
 
+        if self.calibration:
+            logger.warning(
+                "Ignoring legacy LeRobot calibration file %s. OpenArm v1 uses the motor zero written "
+                "by the official openarm-can calibration tool.",
+                self.calibration_fpath,
+            )
+
         self.bus = DamiaoMotorsBus(
             port=self.config.port,
             motors=motors,
-            calibration=self.calibration,
+            calibration={},
             can_interface=self.config.can_interface,
             use_can_fd=self.config.use_can_fd,
             bitrate=self.config.can_bitrate,
@@ -98,76 +106,27 @@ class OpenArmLeader(Teleoperator):
         logger.info(f"Connecting arm on {self.config.port}...")
         self.bus.connect()
 
-        # Run calibration if needed
-        if not self.is_calibrated and calibrate:
+        if calibrate:
             logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
+                "Using the existing OpenArm motor zero. LeRobot will not write or replace zero positions."
             )
-            self.calibrate()
 
         self.configure()
-
-        if self.is_calibrated:
-            self.bus.set_zero_position()
 
         logger.info(f"{self} connected.")
 
     @property
     def is_calibrated(self) -> bool:
-        """Check if teleoperator is calibrated."""
-        return self.bus.is_calibrated
+        """OpenArm motor-zero calibration is managed externally, not by LeRobot."""
+        return True
 
     def calibrate(self) -> None:
-        """
-        Run calibration procedure for OpenArms leader.
-
-        The calibration procedure:
-        1. Disable torque (if not already disabled)
-        2. Ask user to position arm in zero position (hanging with gripper closed)
-        3. Set this as zero position
-        4. Record range of motion for each joint
-        5. Save calibration
-        """
-        if self.calibration:
-            # Calibration file exists, ask user whether to use it or run new calibration
-            user_input = input(
-                f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
-            )
-            if user_input.strip().lower() != "c":
-                logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
-                self.bus.write_calibration(self.calibration)
-                return
-
-        logger.info(f"\nRunning calibration for {self}")
-        self.bus.disable_torque()
-
-        # Step 1: Set zero position
-        input(
-            "\nCalibration: Set Zero Position)\n"
-            "Position the arm in the following configuration:\n"
-            "  - Arm hanging straight down\n"
-            "  - Gripper closed\n"
-            "Press ENTER when ready..."
+        """Reject generic calibration because it would replace the OpenArm motor zero."""
+        raise RuntimeError(
+            "OpenArm v1 cannot be calibrated with lerobot-calibrate. Stop all controllers and run "
+            "the official openarm-can-zero-position-calibration procedure for each arm instead. "
+            f"LeRobot expects positions in {OPENARM_V1_COORDINATE_FRAME} degrees."
         )
-
-        # Set current position as zero for all motors
-        self.bus.set_zero_position()
-        logger.info("Arm zero position set.")
-
-        logger.info("Setting range: -90° to +90° by default for all joints")
-        # TODO(Steven, Pepijn): Check if MotorCalibration is actually needed here given that we only use Degrees
-        for motor_name, motor in self.bus.motors.items():
-            self.calibration[motor_name] = MotorCalibration(
-                id=motor.id,
-                drive_mode=0,
-                homing_offset=0,
-                range_min=-90,
-                range_max=90,
-            )
-
-        self.bus.write_calibration(self.calibration)
-        self._save_calibration()
-        print(f"Calibration saved to {self.calibration_fpath}")
 
     def configure(self) -> None:
         """

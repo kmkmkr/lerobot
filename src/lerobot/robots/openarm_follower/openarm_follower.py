@@ -15,12 +15,13 @@
 # limitations under the License.
 
 import logging
+import math
 import time
 from functools import cached_property
 from typing import Any
 
 from lerobot.cameras import make_cameras_from_configs
-from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
@@ -29,11 +30,44 @@ from ..robot import Robot
 from ..utils import ensure_safe_goal_position
 from .config_openarm_follower import (
     LEFT_DEFAULT_JOINTS_LIMITS,
+    OPENARM_FALLBACK_JOINT_LIMITS,
+    OPENARM_V1_COORDINATE_FRAME,
+    OPENARM_V1_PHYSICAL_JOINT_LIMITS,
     RIGHT_DEFAULT_JOINTS_LIMITS,
     OpenArmFollowerConfig,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_joint_limits(
+    joint_limits: dict[str, tuple[float, float]],
+    motor_names: set[str],
+    side: str | None,
+) -> None:
+    missing = motor_names - set(joint_limits)
+    unknown = set(joint_limits) - motor_names
+    if missing or unknown:
+        raise ValueError(
+            "joint_limits must contain exactly the configured motors "
+            f"(missing={sorted(missing)}, unknown={sorted(unknown)})"
+        )
+
+    physical_limits = OPENARM_V1_PHYSICAL_JOINT_LIMITS.get(side) if side is not None else None
+    for motor_name, limits in joint_limits.items():
+        if len(limits) != 2:
+            raise ValueError(f"joint_limits[{motor_name!r}] must contain (minimum, maximum)")
+        minimum, maximum = limits
+        if not math.isfinite(minimum) or not math.isfinite(maximum) or minimum >= maximum:
+            raise ValueError(f"joint_limits[{motor_name!r}] must be finite and increasing, got {limits}")
+        if physical_limits is None:
+            continue
+        physical_minimum, physical_maximum = physical_limits[motor_name]
+        if minimum < physical_minimum or maximum > physical_maximum:
+            raise ValueError(
+                f"joint_limits[{motor_name!r}]={limits} exceeds the OpenArm v1 {side} physical "
+                f"limit {(physical_minimum, physical_maximum)} in {OPENARM_V1_COORDINATE_FRAME} degrees"
+            )
 
 
 class OpenArmFollower(Robot):
@@ -49,6 +83,14 @@ class OpenArmFollower(Robot):
         super().__init__(config)
         self.config = config
 
+        if config.coordinate_frame != OPENARM_V1_COORDINATE_FRAME:
+            raise ValueError(
+                f"Unsupported OpenArm coordinate frame {config.coordinate_frame!r}; "
+                f"expected {OPENARM_V1_COORDINATE_FRAME!r}"
+            )
+        if config.side not in (None, "left", "right"):
+            raise ValueError("config.side must be either 'left', 'right', or None")
+
         # Arm motors
         motors: dict[str, Motor] = {}
         for motor_name, (send_id, recv_id, motor_type_str) in config.motor_config.items():
@@ -59,29 +101,41 @@ class OpenArmFollower(Robot):
             motor.motor_type_str = motor_type_str
             motors[motor_name] = motor
 
+        if self.calibration:
+            logger.warning(
+                "Ignoring legacy LeRobot calibration file %s. OpenArm v1 uses the motor zero written "
+                "by the official openarm-can calibration tool.",
+                self.calibration_fpath,
+            )
+
         self.bus = DamiaoMotorsBus(
             port=self.config.port,
             motors=motors,
-            calibration=self.calibration,
+            calibration={},
             can_interface=self.config.can_interface,
             use_can_fd=self.config.use_can_fd,
             bitrate=self.config.can_bitrate,
             data_bitrate=self.config.can_data_bitrate if self.config.use_can_fd else None,
         )
 
-        if config.side is not None:
+        if config.joint_limits is None:
             if config.side == "left":
-                config.joint_limits = LEFT_DEFAULT_JOINTS_LIMITS
+                config.joint_limits = dict(LEFT_DEFAULT_JOINTS_LIMITS)
             elif config.side == "right":
-                config.joint_limits = RIGHT_DEFAULT_JOINTS_LIMITS
+                config.joint_limits = dict(RIGHT_DEFAULT_JOINTS_LIMITS)
             else:
-                raise ValueError(
-                    "config.side must be either 'left', 'right' (for default values) or 'None' (for CLI values)"
+                config.joint_limits = dict(OPENARM_FALLBACK_JOINT_LIMITS)
+                logger.warning(
+                    "config.side is not set; using narrow fallback joint limits. Set side to 'left' or "
+                    "'right' for the OpenArm v1 deployment limits."
                 )
         else:
-            logger.info(
-                "Set config.side to either 'left' or 'right' to use pre-configured values for joint limits."
-            )
+            config.joint_limits = dict(config.joint_limits)
+
+        assert config.joint_limits is not None
+        _validate_joint_limits(config.joint_limits, set(config.motor_config), config.side)
+        if config.side is None:
+            logger.warning("Physical joint-limit validation is unavailable until config.side is set.")
         logger.info(f"Values used for joint limits: {config.joint_limits}.")
 
         # Initialize cameras
@@ -128,30 +182,25 @@ class OpenArmFollower(Robot):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         """
-        Connect to the robot and optionally calibrate.
+        Connect without modifying the motor-zero coordinate frame.
 
-        We assume that at connection time, the arms are in a safe rest position,
-        and torque can be safely disabled to run calibration if needed.
+        ``calibrate`` is accepted for the common Robot API, but OpenArm zero
+        calibration is an external hardware setup step and is never run here.
         """
 
         # Connect to CAN bus
         logger.info(f"Connecting arm on {self.config.port}...")
         self.bus.connect()
 
-        # Run calibration if needed
-        if not self.is_calibrated and calibrate:
+        if calibrate:
             logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
+                "Using the existing OpenArm motor zero. LeRobot will not write or replace zero positions."
             )
-            self.calibrate()
 
         for cam in self.cameras.values():
             cam.connect()
 
         self.configure()
-
-        if self.is_calibrated:
-            self.bus.set_zero_position()
 
         self.bus.enable_torque()
 
@@ -159,59 +208,16 @@ class OpenArmFollower(Robot):
 
     @property
     def is_calibrated(self) -> bool:
-        """Check if robot is calibrated."""
-        return self.bus.is_calibrated
+        """OpenArm motor-zero calibration is managed externally, not by LeRobot."""
+        return True
 
     def calibrate(self) -> None:
-        """
-        Run calibration procedure for OpenArms robot.
-
-        The calibration procedure:
-        1. Disable torque
-        2. Ask user to position arms in hanging position with grippers closed
-        3. Set this as zero position
-        4. Record range of motion for each joint
-        5. Save calibration
-        """
-        if self.calibration:
-            # Calibration file exists, ask user whether to use it or run new calibration
-            user_input = input(
-                f"Press ENTER to use provided calibration file associated with the id {self.id}, or type 'c' and press ENTER to run calibration: "
-            )
-            if user_input.strip().lower() != "c":
-                logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
-                self.bus.write_calibration(self.calibration)
-                return
-
-        logger.info(f"\nRunning calibration for {self}")
-        self.bus.disable_torque()
-
-        # Step 1: Set zero position
-        input(
-            "\nCalibration: Set Zero Position)\n"
-            "Position the arm in the following configuration:\n"
-            "  - Arm hanging straight down\n"
-            "  - Gripper closed\n"
-            "Press ENTER when ready..."
+        """Reject generic calibration because it would replace the OpenArm motor zero."""
+        raise RuntimeError(
+            "OpenArm v1 cannot be calibrated with lerobot-calibrate. Stop all controllers and run "
+            "the official openarm-can-zero-position-calibration procedure for each arm instead. "
+            f"LeRobot expects positions in {OPENARM_V1_COORDINATE_FRAME} degrees."
         )
-
-        # Set current position as zero for all motors
-        self.bus.set_zero_position()
-        logger.info("Arm zero position set.")
-
-        logger.info("Setting range: -90° to +90° for safety by default for all joints")
-        for motor_name, motor in self.bus.motors.items():
-            self.calibration[motor_name] = MotorCalibration(
-                id=motor.id,
-                drive_mode=0,
-                homing_offset=0,
-                range_min=-90,
-                range_max=90,
-            )
-
-        self.bus.write_calibration(self.calibration)
-        self._save_calibration()
-        print(f"Calibration saved to {self.calibration_fpath}")
 
     def configure(self) -> None:
         """Configure motors with appropriate settings."""
@@ -288,9 +294,11 @@ class OpenArmFollower(Robot):
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
         # Apply joint limit clipping to arm
+        joint_limits = self.config.joint_limits
+        assert joint_limits is not None
         for motor_name, position in goal_pos.items():
-            if motor_name in self.config.joint_limits:
-                min_limit, max_limit = self.config.joint_limits[motor_name]
+            if motor_name in joint_limits:
+                min_limit, max_limit = joint_limits[motor_name]
                 clipped_position = max(min_limit, min(max_limit, position))
                 if clipped_position != position:
                     logger.debug(f"Clipped {motor_name} from {position:.2f}° to {clipped_position:.2f}°")

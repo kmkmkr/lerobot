@@ -60,14 +60,20 @@ For hosts without an NVIDIA GPU, disable `--nv`:
 LEROBOT_OPENARM_NV=0 ./apptainer/openarm_lerobot_exec.sh uv run --no-sync lerobot-info --help
 ```
 
-The wrapper does not bind the host `/dev` tree by default because that can
-interfere with `uv`'s Python interpreter checks on some Apptainer setups. CAN
-interfaces are host network interfaces, not `/dev` nodes. If a USB camera or
-other device is not visible, opt in per command:
+The wrapper does not bind the host `/dev` tree by default. CAN interfaces are
+host network interfaces, not `/dev` nodes, and the tested RealSense D435 is
+available through Apptainer without a full `/dev` bind. Verify it with:
 
 ```bash
-LEROBOT_OPENARM_BIND_DEV=1 ./apptainer/openarm_lerobot_exec.sh v4l2-ctl --list-devices
+./apptainer/openarm_lerobot_exec.sh \
+  uv run --no-sync lerobot-find-cameras realsense
 ```
+
+Do not set `LEROBOT_OPENARM_BIND_DEV=1` for this RealSense setup. Binding the
+entire host `/dev` tree made device nodes such as `/dev/urandom` inaccessible
+inside the container and caused PyTorch to fail with
+`RuntimeError: Unable to open /dev/urandom`. Use the full-device bind only as a
+last-resort diagnostic for hardware that is otherwise invisible.
 
 ## CAN Setup
 
@@ -88,12 +94,15 @@ sudo ./apptainer/openarm_lerobot_exec.sh \
   .venv/bin/lerobot-setup-can --mode=setup --interfaces=can0,can1,can2,can3
 ```
 
-Test communication:
+Test motor communication only after supporting every arm safely:
 
 ```bash
 sudo ./apptainer/openarm_lerobot_exec.sh \
   .venv/bin/lerobot-setup-can --mode=test --interfaces=can0,can1,can2,can3
 ```
+
+This is not a passive bus probe: `--mode=test` briefly enables and then disables
+each motor while checking for its response.
 
 If raw CAN sockets are permitted for your normal user, `sudo` is not required.
 When using `sudo`, prefer `.venv/bin/<command>` or `uv run --no-sync` so the
@@ -101,52 +110,44 @@ root process does not modify the local Python environment.
 
 ## CAN Mapping
 
-The existing bilateral setup in `../openarm_teleop` documents `right: leader
-can0 / follower can2` and `left: leader can1 / follower can3`. On this
-LeRobot setup, the first hardware test showed those functional roles are
-reversed. Use this observed mapping unless the cables are changed:
+The following mapping was confirmed with unilateral LeRobot teleoperation on
+this workstation. Recheck it after changing USB-CAN adapters or cables:
 
 | Arm | Leader CAN (`teleop.*`) | Follower CAN (`robot.*`) |
 | --- | --- | --- |
-| right | `can2` | `can0` |
-| left | `can3` | `can1` |
+| right | `can0` | `can2` |
+| left | `can1` | `can3` |
 
-If moving a follower arm makes a leader arm move, swap the `robot.*` and
-`teleop.*` ports.
+LeRobot does not discover these roles from the motor. A port passed under
+`robot.*` is configured as the torque-enabled follower, while a port passed
+under `teleop.*` is configured as the manually moved leader. If moving a
+physical follower makes a physical leader move, stop immediately and correct
+the port assignments.
 
-## Calibrate
+## OpenArm Motor-Zero Calibration
 
-Calibrate each physical arm once. The IDs below keep calibration files stable
-between runs.
+OpenArm v1/v1.1 uses the zero stored in each Damiao motor as its joint coordinate
+frame. Stop every controller, support the arms, and run the official OpenArm
+zero-position calibration once per physical arm:
 
 ```bash
-# Followers
-sudo ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-calibrate \
-  --robot.type=openarm_follower \
-  --robot.port=can1 \
-  --robot.side=left \
-  --robot.id=openarm_v1_follower_left
-
-sudo ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-calibrate \
-  --robot.type=openarm_follower \
-  --robot.port=can0 \
-  --robot.side=right \
-  --robot.id=openarm_v1_follower_right
-
 # Leaders
-sudo ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-calibrate \
-  --teleop.type=openarm_leader \
-  --teleop.port=can3 \
-  --teleop.id=openarm_v1_leader_left
+./apptainer/openarm_lerobot_exec.sh \
+  openarm-can-zero-position-calibration --canport can0 --arm-side right_arm
+./apptainer/openarm_lerobot_exec.sh \
+  openarm-can-zero-position-calibration --canport can1 --arm-side left_arm
 
-sudo ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-calibrate \
-  --teleop.type=openarm_leader \
-  --teleop.port=can2 \
-  --teleop.id=openarm_v1_leader_right
+# Followers
+./apptainer/openarm_lerobot_exec.sh \
+  openarm-can-zero-position-calibration --canport can2 --arm-side right_arm
+./apptainer/openarm_lerobot_exec.sh \
+  openarm-can-zero-position-calibration --canport can3 --arm-side left_arm
 ```
 
-If calibration files were created while the ports were reversed, rerun
-calibration with the ports above and choose recalibration when prompted.
+Do not run `lerobot-calibrate` for a full-size OpenArm v1 leader or follower.
+The current integration uses the official motor-zero frame directly, does not
+rewrite zero positions during `connect()`, and ignores legacy LeRobot OpenArm
+calibration JSON files.
 
 ## Teleoperate Without Recording
 
@@ -155,16 +156,16 @@ joint positions to follower joint targets and does not provide bilateral force
 feedback.
 
 ```bash
-sudo ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-teleoperate \
+./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-teleoperate \
   --robot.type=bi_openarm_follower \
-  --robot.left_arm_config.port=can1 \
+  --robot.left_arm_config.port=can3 \
   --robot.left_arm_config.side=left \
-  --robot.right_arm_config.port=can0 \
+  --robot.right_arm_config.port=can2 \
   --robot.right_arm_config.side=right \
   --robot.id=openarm_v1_follower \
   --teleop.type=bi_openarm_leader \
-  --teleop.left_arm_config.port=can3 \
-  --teleop.right_arm_config.port=can2 \
+  --teleop.left_arm_config.port=can1 \
+  --teleop.right_arm_config.port=can0 \
   --teleop.id=openarm_v1_leader \
   --fps=30 \
   --display_data=false
@@ -173,32 +174,43 @@ sudo ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-teleoperate \
 Start with conservative limits if this is a first run:
 
 ```bash
-  --robot.left_arm_config.max_relative_target=5 \
-  --robot.right_arm_config.max_relative_target=5
+  --robot.left_arm_config.max_relative_target=1.0 \
+  --robot.right_arm_config.max_relative_target=1.0
 ```
+
+Align each leader and follower in a similar safe pose before connecting. The
+relative-target limit is useful for a first motion test, but it is not a
+zero-position or pose-alignment procedure.
 
 ## Record A LeRobot Dataset
 
 Use `--dataset.push_to_hub=false` while testing. LeRobot stamps the repository
-ID with a timestamp when creating a new local dataset.
+ID with a timestamp when creating a new local dataset. The following command was
+validated with an Intel RealSense D435 at 640x480 and 30 FPS. Replace the camera
+ID with the `Id` printed by `lerobot-find-cameras realsense` if the camera is
+changed.
 
 ```bash
-sudo ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-record \
+ROOT="./data/openarm_v1_bimanual_$(date +%Y%m%d_%H%M%S)"
+
+./apptainer/openarm_lerobot_exec.sh \
+  .venv/bin/lerobot-record \
   --robot.type=bi_openarm_follower \
-  --robot.left_arm_config.port=can1 \
+  --robot.left_arm_config.port=can3 \
   --robot.left_arm_config.side=left \
-  --robot.right_arm_config.port=can0 \
+  --robot.right_arm_config.port=can2 \
   --robot.right_arm_config.side=right \
   --robot.id=openarm_v1_follower \
+  --robot.cameras='{front: {type: intelrealsense, serial_number_or_name: "152222070204", width: 640, height: 480, fps: 30, use_depth: false}}' \
   --teleop.type=bi_openarm_leader \
-  --teleop.left_arm_config.port=can3 \
-  --teleop.right_arm_config.port=can2 \
+  --teleop.left_arm_config.port=can1 \
+  --teleop.right_arm_config.port=can0 \
   --teleop.id=openarm_v1_leader \
-  --dataset.repo_id=${HF_USER:-local}/openarm_v1_bimanual_test \
-  --dataset.root=./data/openarm_v1_bimanual_test \
-  --dataset.single_task="Teleoperate OpenArm v1 bimanual setup" \
+  --dataset.repo_id="${HF_USER:-local}/openarm_v1_bimanual" \
+  --dataset.root="$ROOT" \
+  --dataset.single_task="Pick up the red cube and place it in the tray" \
   --dataset.fps=30 \
-  --dataset.num_episodes=2 \
+  --dataset.num_episodes=10 \
   --dataset.episode_time_s=30 \
   --dataset.reset_time_s=15 \
   --dataset.push_to_hub=false \
@@ -208,7 +220,11 @@ sudo ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-record \
   --play_sounds=false
 ```
 
-Add cameras to the robot config when ready, for example:
+The successful RealSense check and recording command do not use
+`LEROBOT_OPENARM_BIND_DEV=1`.
+
+To collect joint-only data without a camera, omit `--robot.cameras`. For an
+OpenCV camera, replace the RealSense configuration, for example:
 
 ```bash
   --robot.cameras='{front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}'
