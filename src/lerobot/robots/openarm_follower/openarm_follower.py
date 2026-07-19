@@ -23,6 +23,7 @@ from typing import Any
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
+from lerobot.motors.damiao.tables import MOTOR_LIMIT_PARAMS, MotorType
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -36,8 +37,25 @@ from .config_openarm_follower import (
     RIGHT_DEFAULT_JOINTS_LIMITS,
     OpenArmFollowerConfig,
 )
+from .openarm_dynamics import OpenArmGravityModel, bilateral_friction_torque
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_position_gains(name: str, values: list[float], motor_count: int, maximum: float) -> None:
+    if len(values) != motor_count:
+        raise ValueError(f"{name} must contain {motor_count} values, got {len(values)}")
+    for index, value in enumerate(values):
+        if not math.isfinite(value) or not 0.0 <= value <= maximum:
+            raise ValueError(f"{name}[{index}] must be between 0 and {maximum}, got {value}")
+
+
+def _validate_finite_values(name: str, values: list[float], expected_count: int) -> None:
+    if len(values) != expected_count:
+        raise ValueError(f"{name} must contain {expected_count} values, got {len(values)}")
+    for index, value in enumerate(values):
+        if not math.isfinite(value):
+            raise ValueError(f"{name}[{index}] must be finite, got {value}")
 
 
 def _validate_joint_limits(
@@ -138,6 +156,36 @@ class OpenArmFollower(Robot):
             logger.warning("Physical joint-limit validation is unavailable until config.side is set.")
         logger.info(f"Values used for joint limits: {config.joint_limits}.")
 
+        motor_count = len(config.motor_config)
+        _validate_position_gains("position_kp", config.position_kp, motor_count, 500.0)
+        _validate_position_gains("position_kd", config.position_kd, motor_count, 5.0)
+        _validate_position_gains("trajectory_position_kp", config.trajectory_position_kp, motor_count, 500.0)
+        _validate_position_gains("trajectory_position_kd", config.trajectory_position_kd, motor_count, 5.0)
+        _validate_finite_values("gravity_scale", config.gravity_scale, 7)
+        for name in (
+            "friction_fc",
+            "friction_k",
+            "friction_fv",
+            "friction_fo",
+            "friction_fc_scale",
+            "friction_fv_scale",
+            "friction_fo_scale",
+        ):
+            _validate_finite_values(name, getattr(config, name), motor_count)
+        if (
+            not math.isfinite(config.compensation_state_max_age_s)
+            or config.compensation_state_max_age_s < 0.0
+        ):
+            raise ValueError("compensation_state_max_age_s must be finite and non-negative")
+        if not math.isfinite(config.gravity_m_s2) or config.gravity_m_s2 <= 0.0:
+            raise ValueError("gravity_m_s2 must be positive and finite")
+        if not math.isfinite(config.friction_tanh_coefficient) or config.friction_tanh_coefficient <= 0.0:
+            raise ValueError("friction_tanh_coefficient must be positive and finite")
+
+        self._gravity_model: OpenArmGravityModel | None = None
+        self._latest_motor_states: dict[str, dict[str, float]] | None = None
+        self._latest_motor_states_time: float | None = None
+
         # Initialize cameras
         self.cameras = make_cameras_from_configs(config.cameras)
 
@@ -188,6 +236,15 @@ class OpenArmFollower(Robot):
         calibration is an external hardware setup step and is never run here.
         """
 
+        if self.config.gravity_compensation:
+            if self.config.side is None:
+                raise ValueError("gravity_compensation requires config.side to be 'left' or 'right'")
+            self._gravity_model = OpenArmGravityModel(
+                self.config.dynamics_urdf_path,
+                self.config.side,
+                self.config.gravity_m_s2,
+            )
+
         # Connect to CAN bus
         logger.info(f"Connecting arm on {self.config.port}...")
         self.bus.connect()
@@ -231,6 +288,26 @@ class OpenArmFollower(Robot):
         )
 
     @check_if_not_connected
+    def get_motor_positions(self) -> dict[str, float]:
+        """Read motor-zero positions without touching any configured cameras."""
+        states = self._read_motor_states()
+        return {motor: float(states[motor]["position"]) for motor in self.bus.motors}
+
+    def trajectory_position_gains(self) -> tuple[dict[str, float], dict[str, float]]:
+        """Return the dedicated CSV-motion PD gains keyed by motor name."""
+        motor_names = list(self.bus.motors)
+        _validate_position_gains(
+            "trajectory_position_kp", self.config.trajectory_position_kp, len(motor_names), 500.0
+        )
+        _validate_position_gains(
+            "trajectory_position_kd", self.config.trajectory_position_kd, len(motor_names), 5.0
+        )
+        return (
+            dict(zip(motor_names, self.config.trajectory_position_kp, strict=True)),
+            dict(zip(motor_names, self.config.trajectory_position_kd, strict=True)),
+        )
+
+    @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         """
         Get current observation from robot including position, velocity, and torque.
@@ -242,7 +319,7 @@ class OpenArmFollower(Robot):
 
         obs_dict: dict[str, Any] = {}
 
-        states = self.bus.sync_read_all_states()
+        states = self._read_motor_states()
 
         for motor in self.bus.motors:
             state = states.get(motor, {})
@@ -270,12 +347,68 @@ class OpenArmFollower(Robot):
 
         return obs_dict
 
+    def _read_motor_states(self) -> dict[str, dict[str, float]]:
+        states = self.bus.sync_read_all_states()
+        self._latest_motor_states = {
+            motor: {key: float(value) for key, value in state.items()} for motor, state in states.items()
+        }
+        self._latest_motor_states_time = time.monotonic()
+        return self._latest_motor_states
+
+    def _compensation_motor_states(self) -> dict[str, dict[str, float]]:
+        if self._latest_motor_states is not None and self._latest_motor_states_time is not None:
+            age_s = time.monotonic() - self._latest_motor_states_time
+            if age_s <= self.config.compensation_state_max_age_s:
+                return self._latest_motor_states
+        return self._read_motor_states()
+
+    def _compensation_torques(self) -> dict[str, float]:
+        motor_names = list(self.bus.motors)
+        if not self.config.gravity_compensation and not self.config.friction_compensation:
+            return dict.fromkeys(motor_names, 0.0)
+
+        states = self._compensation_motor_states()
+        gravity = (0.0,) * 7
+        if self.config.gravity_compensation:
+            if self._gravity_model is None:
+                raise RuntimeError("OpenArm gravity model is unavailable before connect()")
+            gravity = self._gravity_model.gravity_torques(
+                tuple(math.radians(states[motor]["position"]) for motor in motor_names[:7])
+            )
+
+        torques: dict[str, float] = {}
+        for index, motor_name in enumerate(motor_names):
+            torque = gravity[index] * self.config.gravity_scale[index] if index < 7 else 0.0
+            if self.config.friction_compensation:
+                velocity_rad_s = math.radians(states[motor_name]["velocity"])
+                torque += bilateral_friction_torque(
+                    velocity_rad_s,
+                    self.config.friction_fc[index] * self.config.friction_fc_scale[index],
+                    self.config.friction_k[index],
+                    self.config.friction_fv[index] * self.config.friction_fv_scale[index],
+                    self.config.friction_fo[index] * self.config.friction_fo_scale[index],
+                    self.config.friction_tanh_coefficient,
+                )
+
+            motor_type_name = self.config.motor_config[motor_name][2].upper().replace("-", "_")
+            motor_type = getattr(MotorType, motor_type_name)
+            torque_limit = MOTOR_LIMIT_PARAMS[motor_type][2]
+            if not math.isfinite(torque) or not -torque_limit <= torque <= torque_limit:
+                raise RuntimeError(
+                    f"OpenArm compensation torque is outside the {motor_name} MIT range: "
+                    f"value={torque} allowed=[{-torque_limit}, {torque_limit}] Nm"
+                )
+            torques[motor_name] = torque
+        return torques
+
     @check_if_not_connected
     def send_action(
         self,
         action: RobotAction,
         custom_kp: dict[str, float] | None = None,
         custom_kd: dict[str, float] | None = None,
+        *,
+        apply_max_relative_target: bool = True,
     ) -> RobotAction:
         """
         Send action command to robot.
@@ -286,6 +419,10 @@ class OpenArmFollower(Robot):
             action: Dictionary with motor positions (e.g., "joint_1.pos", "joint_2.pos")
             custom_kp: Optional custom kp gains per motor (e.g., {"joint_1": 120.0, "joint_2": 150.0})
             custom_kd: Optional custom kd gains per motor (e.g., {"joint_1": 1.5, "joint_2": 2.0})
+            apply_max_relative_target: Apply the policy-action relative target
+                limiter. Validated deployment trajectories disable this because
+                they have their own joint, velocity, clipping, and tracking
+                checks.
 
         Returns:
             The action actually sent (potentially clipped)
@@ -306,10 +443,12 @@ class OpenArmFollower(Robot):
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
-        if self.config.max_relative_target is not None:
+        if apply_max_relative_target and self.config.max_relative_target is not None:
             present_pos = self.bus.sync_read("Present_Position")
             goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
             goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+
+        compensation_torques = self._compensation_torques()
 
         # TODO(Steven, Pepijn): Refactor writing
         # Motor name to index mapping for gains
@@ -345,7 +484,7 @@ class OpenArmFollower(Robot):
                     if isinstance(self.config.position_kd, list)
                     else self.config.position_kd
                 )
-            commands[motor_name] = (kp, kd, position_degrees, 0.0, 0.0)
+            commands[motor_name] = (kp, kd, position_degrees, 0.0, compensation_torques[motor_name])
 
         self.bus._mit_control_batch(commands)
 

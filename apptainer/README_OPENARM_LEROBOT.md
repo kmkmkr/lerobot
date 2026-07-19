@@ -12,6 +12,17 @@ The container includes:
 It intentionally does not install LeRobot Python dependencies at image build
 time. Run `uv sync` inside the container after binding this repository.
 
+In this project, task demonstrations are collected with the native bilateral
+controller in `dora-openarm-data-collection`. LeRobot is used for training and
+policy deployment. The LeRobot teleoperation and recording commands below are
+useful diagnostics or alternatives, but they do not replace the bilateral Dora
+collection path.
+
+See [OPENARM_FOLLOWER_CONTROL_COMPARISON.md](OPENARM_FOLLOWER_CONTROL_COMPARISON.md)
+for a comparison of follower PD gains, gravity/friction compensation, and joint
+limits across bilateral collection, policy inference, and their startup/shutdown
+trajectory motions.
+
 ## Build
 
 From the LeRobot repository root:
@@ -148,6 +159,147 @@ Do not run `lerobot-calibrate` for a full-size OpenArm v1 leader or follower.
 The current integration uses the official motor-zero frame directly, does not
 rewrite zero positions during `connect()`, and ignores legacy LeRobot OpenArm
 calibration JSON files.
+
+## Deploy A Policy From The Task-Ready Pose
+
+`lerobot-rollout` can reuse the exact CSV profile exported for bilateral
+teleoperation. When `robot.deployment_trajectory_profile` is set, the policy
+deployment lifecycle is:
+
+1. Connect both followers and move them smoothly to exact motor zero.
+2. Replay `left_arm.csv` and `right_arm.csv` together to the task-ready pose.
+3. Re-send the final position through the policy-inference gain fields, whose
+   defaults equal the trajectory and native bilateral gains, then start inference.
+4. At shutdown, blend both followers back to the recorded task-ready pose,
+   replay both CSV files in reverse, and finish at exact motor zero.
+5. If any shutdown joint differs from its task-ready position by more than the
+   warning threshold, ask `yes/no` before moving. A non-interactive session
+   chooses `no` and disables the motors in place.
+
+### Test Only The Home-Motion Round Trip
+
+Before starting a full rollout, run the same startup and shutdown motion code
+without loading a policy, dataset, or camera. This command performs exactly one
+cycle: current pose to exact motor zero, forward CSV replay to the task-ready
+pose, a short hold, reverse CSV replay, and return to exact motor zero.
+
+```bash
+unset LEROBOT_OPENARM_BIND_DEV
+PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
+
+./apptainer/openarm_lerobot_exec.sh .venv/bin/python -m \
+  lerobot.scripts.lerobot_openarm_home_motion_test \
+  --robot.type=bi_openarm_follower \
+  --robot.left_arm_config.port=can3 \
+  --robot.left_arm_config.side=left \
+  --robot.right_arm_config.port=can2 \
+  --robot.right_arm_config.side=right \
+  --robot.id=openarm_v1_follower \
+  --robot.deployment_trajectory_profile="$PROFILE" \
+  --home_hold_s=3.0
+```
+
+The script asks `yes/no` before connecting to the CAN interfaces and moving. It
+uses `/dev/tty` when available and otherwise falls back to the interactive
+standard input already forwarded by Apptainer; do not bind the complete host
+`/dev` tree for this prompt. Use `--confirm_before_motion=false` only for an
+intentionally unattended test.
+It invokes `prepare_for_policy_deployment()` and
+`finish_policy_deployment()` directly, so its gains, compensation, trajectory
+validation, interpolation, tracking-error handling, and shutdown warning are
+the same as `lerobot-rollout`. It always attempts to disable and disconnect
+both arms after success or failure and rejects configurations that disable this
+safety behavior. If the process is interrupted, it disables and disconnects
+the arms without initiating another recovery motion.
+
+After reinstalling or syncing the editable project, the equivalent console
+entry point is `lerobot-openarm-home-motion-test`.
+
+The Apptainer wrapper automatically binds the sibling directory
+`../openarm_teleop/config/startup_trajectories` read-only at
+`/workspace/openarm_startup_trajectories`. Override the host directory when the
+repositories are laid out differently:
+
+```bash
+LEROBOT_OPENARM_TRAJECTORY_ROOT=/absolute/path/to/startup_trajectories \
+  ./apptainer/openarm_lerobot_exec.sh <command>
+```
+
+The following base rollout uses the profile collected on 2026-07-18. Camera
+names must match the converted Dora dataset and policy checkpoint. Per-arm
+camera key `wrist` becomes `left_wrist` or `right_wrist` in the bimanual
+observation:
+
+```bash
+POLICY_PATH=/absolute/path/to/pretrained_model
+PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
+
+./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-rollout \
+  --strategy.type=base \
+  --policy.path="$POLICY_PATH" \
+  --robot.type=bi_openarm_follower \
+  --robot.left_arm_config.port=can3 \
+  --robot.left_arm_config.side=left \
+  --robot.left_arm_config.cameras='{wrist: {type: opencv, index_or_path: /dev/video8, width: 640, height: 480, fps: 30}}' \
+  --robot.right_arm_config.port=can2 \
+  --robot.right_arm_config.side=right \
+  --robot.right_arm_config.cameras='{wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}}' \
+  --robot.cameras='{front: {type: opencv, index_or_path: /dev/video6, width: 640, height: 480, fps: 30}}' \
+  --robot.id=openarm_v1_follower \
+  --robot.deployment_trajectory_profile="$PROFILE" \
+  --return_to_initial_position=true \
+  --task="Pick up the red cube and place it in the tray" \
+  --duration=60 \
+  --display_data=false
+```
+
+`trajectory_position_kp` and `trajectory_position_kd` apply only to the zero
+and CSV motions. `position_kp` and `position_kd` apply to policy actions. Set
+them independently only for temporary diagnostics. All four defaults are kept
+equal to the native bilateral follower because it is the canonical controller
+configuration, so the normal rollout command should not override them.
+Likewise, `max_relative_target` limits policy actions but is deliberately not
+applied to the validated zero/CSV deployment trajectory, which already has
+joint-limit, velocity, exact-target clipping, and tracking-error checks.
+
+LeRobot also applies the native follower's gravity and friction feed-forward
+terms during policy inference and trajectory motions. The wrapper generates a
+v10 bimanual URDF from the sibling native `openarm_teleop.sif` on every launch,
+then binds it read-only into the LeRobot container. This ensures the Python
+gravity model consumes the same OpenArm Description 1.0.4 model as the native
+KDL controller. Override the source image or provide an already generated host
+URDF when needed:
+
+```bash
+LEROBOT_OPENARM_TELEOP_IMAGE=/absolute/path/to/openarm_teleop.sif \
+  ./apptainer/openarm_lerobot_exec.sh <command>
+
+LEROBOT_OPENARM_DYNAMICS_URDF=/absolute/path/to/v10_bimanual.urdf \
+  ./apptainer/openarm_lerobot_exec.sh <command>
+```
+
+`LEROBOT_OPENARM_ENABLE_COMPENSATION=0` disables both gravity and friction
+compensation. It is intended only for diagnosis; the normal deployment default
+is enabled.
+
+Relevant motion settings and defaults are:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `robot.deployment_control_frequency_hz` | `50` | CSV interpolation/control rate |
+| `robot.startup_zero_pose_duration_s` | `2.2` | Current pose to exact zero |
+| `robot.startup_trajectory_speed` | `1.0` | Forward CSV speed scale |
+| `robot.startup_trajectory_blend_s` | `1.0` | Exact zero to first CSV sample |
+| `robot.shutdown_task_pose_blend_s` | `10.0` | Final policy pose to task-ready pose |
+| `robot.shutdown_replay_speed` | `0.25` | Reverse CSV speed scale |
+| `robot.shutdown_zero_transition_s` | `1.0` | Recorded-time transition from first sample to exact zero |
+| `robot.shutdown_task_pose_warn_deg` | `28.6479` | Confirmation threshold, equivalent to `0.5 rad` |
+| `robot.deployment_tracking_error_deg` | `20.0535` | Abort-and-disable threshold, equivalent to `0.35 rad` |
+
+The zero transition is part of the reverse trajectory and is therefore also
+scaled by `shutdown_replay_speed`. Set `--return_to_initial_position=false` to
+skip the complete shutdown return and disable the followers in their final
+pose.
 
 ## Teleoperate Without Recording
 

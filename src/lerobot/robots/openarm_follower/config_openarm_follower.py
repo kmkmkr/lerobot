@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass, field
 
 from lerobot.cameras import CameraConfig
@@ -25,6 +26,27 @@ OPENARM_V1_DESCRIPTION_PROFILE = "v10"
 OPENARM_V1_DESCRIPTION_REF = "1.0.4"
 OPENARM_V1_COORDINATE_FRAME = "openarm_v1_motor_zero"
 OPENARM_V1_CALIBRATION_METHOD = "openarm_can_zero_position"
+
+# Canonical defaults mirrored from openarm_teleop/config/follower.yaml and the
+# dora-openarm-data-collection launcher's default J7_TUNING_PROFILE=validated.
+# Keep these values synchronized with the native bilateral follower.
+BILATERAL_FOLLOWER_KP = (240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0, 16.0)
+BILATERAL_FOLLOWER_KD = (3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2, 0.2)
+BILATERAL_FOLLOWER_FC = (0.306, 0.306, 0.40, 0.166, 0.050, 0.093, 0.172, 0.0512)
+BILATERAL_FOLLOWER_FRICTION_K = (28.417, 28.417, 29.065, 130.038, 151.771, 242.287, 7.888, 4.0)
+BILATERAL_FOLLOWER_FV = (0.063, 0.063, 0.604, 0.813, 0.029, 0.072, 0.084, 0.084)
+BILATERAL_FOLLOWER_FO = (0.088, 0.088, 0.008, -0.058, 0.005, 0.009, -0.059, -0.050)
+BILATERAL_FOLLOWER_GRAVITY_SCALE = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.95)
+BILATERAL_FOLLOWER_FC_SCALE = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.25, 1.0)
+BILATERAL_FOLLOWER_FV_SCALE = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.25, 1.0)
+BILATERAL_FOLLOWER_FO_SCALE = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.15, 1.0)
+BILATERAL_GRAVITY_M_S2 = 9.81
+BILATERAL_FRICTION_TANH_COEFFICIENT = 0.1
+
+
+def _compensation_enabled_by_default() -> bool:
+    return os.environ.get("LEROBOT_OPENARM_ENABLE_COMPENSATION", "1") != "0"
+
 
 # Limits in the OpenArm v1 v10 description, expressed in motor-zero degrees.
 # Source: openarm_description 1.0.4, config/arm/v10/joint_limits.yaml.
@@ -153,10 +175,35 @@ class OpenArmFollowerConfigBase:
 
     # MIT control parameters for position control (used in send_action)
     # List of 8 values: [joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, joint_7, gripper]
-    position_kp: list[float] = field(
-        default_factory=lambda: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0, 25.0]
+    position_kp: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_KP))
+    position_kd: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_KD))
+
+    # CSV home-motion gains remain independently configurable, but both sets of
+    # defaults match the native bilateral follower. Compensation is shared too.
+    trajectory_position_kp: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_KP))
+    trajectory_position_kd: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_KD))
+
+    # Native bilateral follower feed-forward compensation. Gravity is computed
+    # from the same v10 bimanual URDF, while friction uses the current motor
+    # velocity in radians per second. J7 scales match Dora's validated profile.
+    gravity_compensation: bool = field(default_factory=_compensation_enabled_by_default)
+    friction_compensation: bool = field(default_factory=_compensation_enabled_by_default)
+    dynamics_urdf_path: str = field(
+        default_factory=lambda: os.environ.get(
+            "LEROBOT_OPENARM_DYNAMICS_URDF", "/workspace/openarm_v10_bimanual.urdf"
+        )
     )
-    position_kd: list[float] = field(default_factory=lambda: [5.0, 5.0, 3.0, 5.0, 0.3, 0.3, 0.3, 0.3])
+    compensation_state_max_age_s: float = 0.1
+    gravity_m_s2: float = BILATERAL_GRAVITY_M_S2
+    gravity_scale: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_GRAVITY_SCALE))
+    friction_tanh_coefficient: float = BILATERAL_FRICTION_TANH_COEFFICIENT
+    friction_fc: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_FC))
+    friction_k: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_FRICTION_K))
+    friction_fv: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_FV))
+    friction_fo: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_FO))
+    friction_fc_scale: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_FC_SCALE))
+    friction_fv_scale: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_FV_SCALE))
+    friction_fo_scale: list[float] = field(default_factory=lambda: list(BILATERAL_FOLLOWER_FO_SCALE))
 
     # Values for joint limits. When omitted, side-specific conservative v1
     # limits are selected. Explicit values are preserved and validated instead

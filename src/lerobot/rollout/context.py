@@ -238,7 +238,17 @@ def build_rollout_context(
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
 
-    # Store the initial joint positions so we can return to a safe pose on shutdown.
+    prepare_for_policy_deployment = getattr(robot, "prepare_for_policy_deployment", None)
+    if callable(prepare_for_policy_deployment):
+        try:
+            prepare_for_policy_deployment()
+        except Exception:
+            logger.exception("Robot policy-deployment startup motion failed; disconnecting hardware")
+            robot.disconnect()
+            raise
+
+    # This is captured after any robot-specific startup motion. It is therefore
+    # also the task-ready reset pose for OpenArm CSV deployment profiles.
     initial_obs = robot.get_observation()
     initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
     logger.info("Captured initial robot position (%d keys)", len(initial_position))

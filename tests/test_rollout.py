@@ -348,3 +348,67 @@ def test_rollout_context_fields():
 
     field_names = {f.name for f in dataclasses.fields(RolloutContext)}
     assert field_names == {"runtime", "hardware", "policy", "processors", "data"}
+
+
+def test_teardown_prefers_robot_specific_policy_deployment_return():
+    from lerobot.rollout import BaseStrategyConfig, HardwareContext
+    from lerobot.rollout.strategies.core import RolloutStrategy
+
+    class TestStrategy(RolloutStrategy):
+        def setup(self, ctx):
+            pass
+
+        def run(self, ctx):
+            pass
+
+        def teardown(self, ctx):
+            pass
+
+    robot = MagicMock()
+    robot.is_connected = True
+    robot.finish_policy_deployment.return_value = True
+    wrapper = MagicMock()
+    wrapper.inner = robot
+    hardware = HardwareContext(
+        robot_wrapper=wrapper,
+        teleop=None,
+        initial_position={"joint_1.pos": 10.0},
+    )
+
+    strategy = TestStrategy(BaseStrategyConfig())
+    strategy._teardown_hardware(hardware)
+
+    robot.finish_policy_deployment.assert_called_once_with()
+    wrapper.get_observation.assert_not_called()
+    robot.disconnect.assert_called_once_with()
+
+
+def test_teardown_disconnects_when_robot_specific_return_fails():
+    from lerobot.rollout import BaseStrategyConfig, HardwareContext
+    from lerobot.rollout.strategies.core import RolloutStrategy
+
+    class TestStrategy(RolloutStrategy):
+        def setup(self, ctx):
+            pass
+
+        def run(self, ctx):
+            pass
+
+        def teardown(self, ctx):
+            pass
+
+    robot = MagicMock()
+    robot.is_connected = True
+    robot.finish_policy_deployment.side_effect = RuntimeError("tracking error")
+    wrapper = MagicMock()
+    wrapper.inner = robot
+    teleop = MagicMock()
+    teleop.is_connected = True
+    hardware = HardwareContext(robot_wrapper=wrapper, teleop=teleop, initial_position={})
+
+    strategy = TestStrategy(BaseStrategyConfig())
+    with pytest.raises(RuntimeError, match="tracking error"):
+        strategy._teardown_hardware(hardware)
+
+    robot.disconnect.assert_called_once_with()
+    teleop.disconnect.assert_called_once_with()

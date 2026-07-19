@@ -15,15 +15,28 @@
 # limitations under the License.
 
 import logging
+import math
+import time
 from functools import cached_property
+from pathlib import Path
 
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.bimanual import BimanualMixin
 from lerobot.utils.decorators import check_if_not_connected
+from lerobot.utils.robot_utils import precise_sleep
 
 from ..openarm_follower import OpenArmFollower, OpenArmFollowerConfig
 from ..robot import Robot
 from .config_bi_openarm_follower import BiOpenArmFollowerConfig
+from .confirmation import confirm_openarm_motion
+from .deployment_trajectory import (
+    MOTOR_NAMES,
+    DeploymentTrajectorySample,
+    build_return_to_zero_trajectory,
+    interpolate_deployment_trajectory,
+    load_deployment_trajectory,
+    validate_deployment_trajectory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +82,22 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             motor_config=config.left_arm_config.motor_config,
             position_kd=config.left_arm_config.position_kd,
             position_kp=config.left_arm_config.position_kp,
+            trajectory_position_kd=config.left_arm_config.trajectory_position_kd,
+            trajectory_position_kp=config.left_arm_config.trajectory_position_kp,
+            gravity_compensation=config.left_arm_config.gravity_compensation,
+            friction_compensation=config.left_arm_config.friction_compensation,
+            dynamics_urdf_path=config.left_arm_config.dynamics_urdf_path,
+            compensation_state_max_age_s=config.left_arm_config.compensation_state_max_age_s,
+            gravity_m_s2=config.left_arm_config.gravity_m_s2,
+            gravity_scale=config.left_arm_config.gravity_scale,
+            friction_tanh_coefficient=config.left_arm_config.friction_tanh_coefficient,
+            friction_fc=config.left_arm_config.friction_fc,
+            friction_k=config.left_arm_config.friction_k,
+            friction_fv=config.left_arm_config.friction_fv,
+            friction_fo=config.left_arm_config.friction_fo,
+            friction_fc_scale=config.left_arm_config.friction_fc_scale,
+            friction_fv_scale=config.left_arm_config.friction_fv_scale,
+            friction_fo_scale=config.left_arm_config.friction_fo_scale,
             joint_limits=config.left_arm_config.joint_limits,
         )
 
@@ -89,14 +118,291 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             motor_config=config.right_arm_config.motor_config,
             position_kd=config.right_arm_config.position_kd,
             position_kp=config.right_arm_config.position_kp,
+            trajectory_position_kd=config.right_arm_config.trajectory_position_kd,
+            trajectory_position_kp=config.right_arm_config.trajectory_position_kp,
+            gravity_compensation=config.right_arm_config.gravity_compensation,
+            friction_compensation=config.right_arm_config.friction_compensation,
+            dynamics_urdf_path=config.right_arm_config.dynamics_urdf_path,
+            compensation_state_max_age_s=config.right_arm_config.compensation_state_max_age_s,
+            gravity_m_s2=config.right_arm_config.gravity_m_s2,
+            gravity_scale=config.right_arm_config.gravity_scale,
+            friction_tanh_coefficient=config.right_arm_config.friction_tanh_coefficient,
+            friction_fc=config.right_arm_config.friction_fc,
+            friction_k=config.right_arm_config.friction_k,
+            friction_fv=config.right_arm_config.friction_fv,
+            friction_fo=config.right_arm_config.friction_fo,
+            friction_fc_scale=config.right_arm_config.friction_fc_scale,
+            friction_fv_scale=config.right_arm_config.friction_fv_scale,
+            friction_fo_scale=config.right_arm_config.friction_fo_scale,
             joint_limits=config.right_arm_config.joint_limits,
         )
 
         self.left_arm = OpenArmFollower(left_arm_config)
         self.right_arm = OpenArmFollower(right_arm_config)
 
+        self._deployment_trajectories: dict[str, list[DeploymentTrajectorySample]] = {}
+        if config.deployment_trajectory_profile is not None:
+            if self.left_arm.config.side != "left" or self.right_arm.config.side != "right":
+                raise ValueError(
+                    "deployment trajectories require left_arm_config.side=left and "
+                    "right_arm_config.side=right"
+                )
+            profile_dir = Path(config.deployment_trajectory_profile).expanduser()
+            for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
+                # Validate dedicated motion gains before touching hardware.
+                arm.trajectory_position_gains()
+                trajectory = load_deployment_trajectory(profile_dir / f"{side}_arm.csv", side)
+                assert arm.config.joint_limits is not None
+                validate_deployment_trajectory(
+                    trajectory, arm.config.joint_limits, config.startup_trajectory_speed
+                )
+                validate_deployment_trajectory(
+                    trajectory, arm.config.joint_limits, config.shutdown_replay_speed
+                )
+                self._deployment_trajectories[side] = trajectory
+            logger.info("Loaded OpenArm deployment trajectory profile: %s", profile_dir)
+
         # Only for compatibility with other parts of the codebase that expect a `robot.cameras` attribute
         self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}
+
+    @property
+    def has_policy_deployment_trajectory(self) -> bool:
+        return bool(self._deployment_trajectories)
+
+    def _disable_both_arms(self) -> None:
+        for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
+            if not arm.bus.is_connected:
+                continue
+            try:
+                arm.bus.disable_torque()
+            except Exception as error:
+                logger.error("Failed to disable %s OpenArm after deployment motion error: %s", side, error)
+
+    def _read_deployment_positions(self) -> dict[str, tuple[float, ...]]:
+        left_positions = self.left_arm.get_motor_positions()
+        right_positions = self.right_arm.get_motor_positions()
+        return {
+            "left": tuple(left_positions[motor] for motor in MOTOR_NAMES),
+            "right": tuple(right_positions[motor] for motor in MOTOR_NAMES),
+        }
+
+    @staticmethod
+    def _as_action(positions: tuple[float, ...]) -> RobotAction:
+        return {
+            f"{motor_name}.pos": position for motor_name, position in zip(MOTOR_NAMES, positions, strict=True)
+        }
+
+    def _send_deployment_targets(
+        self,
+        targets: dict[str, tuple[float, ...]],
+        *,
+        phase: str,
+        reference_time_s: float,
+    ) -> None:
+        sent_targets: dict[str, RobotAction] = {}
+        for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
+            trajectory_kp, trajectory_kd = arm.trajectory_position_gains()
+            sent_targets[side] = arm.send_action(
+                self._as_action(targets[side]),
+                custom_kp=trajectory_kp,
+                custom_kd=trajectory_kd,
+                apply_max_relative_target=False,
+            )
+
+        for side in ("left", "right"):
+            for motor_name, requested in zip(MOTOR_NAMES, targets[side], strict=True):
+                sent = float(sent_targets[side][f"{motor_name}.pos"])
+                if not math.isclose(sent, requested, abs_tol=1e-6):
+                    raise RuntimeError(
+                        f"OpenArm deployment trajectory target was clipped: side={side} "
+                        f"motor={motor_name} requested={requested:.3f} sent={sent:.3f} deg"
+                    )
+
+        measured = self._read_deployment_positions()
+        error_limit = self.config.deployment_tracking_error_deg
+        for side in ("left", "right"):
+            for motor_name, target, actual in zip(MOTOR_NAMES, targets[side], measured[side], strict=True):
+                tracking_error = abs(actual - target)
+                if tracking_error > error_limit:
+                    raise RuntimeError(
+                        f"OpenArm deployment trajectory tracking error: side={side} phase={phase} "
+                        f"time={reference_time_s:.3f}s motor={motor_name} target={target:.3f} "
+                        f"actual={actual:.3f} error={tracking_error:.3f} limit={error_limit:.3f} deg"
+                    )
+
+    def _blend_deployment_positions(
+        self,
+        start: dict[str, tuple[float, ...]],
+        target: dict[str, tuple[float, ...]],
+        duration_s: float,
+        phase: str,
+    ) -> None:
+        if duration_s <= 0.0:
+            self._send_deployment_targets(target, phase=phase, reference_time_s=0.0)
+            return
+        steps = max(math.ceil(duration_s * self.config.deployment_control_frequency_hz), 1)
+        start_time = time.perf_counter()
+        for step in range(1, steps + 1):
+            elapsed_s = duration_s * step / steps
+            sleep_s = start_time + elapsed_s - time.perf_counter()
+            if sleep_s > 0.0:
+                precise_sleep(sleep_s)
+            alpha = step / steps
+            smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            positions = {
+                side: tuple(
+                    before + (after - before) * smooth_alpha
+                    for before, after in zip(start[side], target[side], strict=True)
+                )
+                for side in ("left", "right")
+            }
+            self._send_deployment_targets(positions, phase=phase, reference_time_s=elapsed_s)
+
+    def _replay_deployment_trajectories(
+        self,
+        trajectories: dict[str, list[DeploymentTrajectorySample]],
+        speed_scale: float,
+        phase: str,
+    ) -> None:
+        recorded_duration_s = max(samples[-1].time_s for samples in trajectories.values())
+        playback_duration_s = recorded_duration_s / speed_scale
+        steps = max(math.ceil(playback_duration_s * self.config.deployment_control_frequency_hz), 1)
+        start_time = time.perf_counter()
+        for step in range(steps + 1):
+            elapsed_s = playback_duration_s * step / steps
+            if step > 0:
+                sleep_s = start_time + elapsed_s - time.perf_counter()
+                if sleep_s > 0.0:
+                    precise_sleep(sleep_s)
+            recorded_time_s = elapsed_s * speed_scale
+            targets = {
+                side: interpolate_deployment_trajectory(samples, recorded_time_s)
+                for side, samples in trajectories.items()
+            }
+            self._send_deployment_targets(targets, phase=phase, reference_time_s=elapsed_s)
+
+    def prepare_for_policy_deployment(self) -> bool:
+        """Move both followers through motor zero and the task-ready CSV before inference."""
+        if not self.has_policy_deployment_trajectory:
+            return False
+
+        logger.info("Moving both OpenArm followers to exact motor zero before CSV replay...")
+        zero_targets = {"left": (0.0,) * len(MOTOR_NAMES), "right": (0.0,) * len(MOTOR_NAMES)}
+        try:
+            current = self._read_deployment_positions()
+            self._blend_deployment_positions(
+                current,
+                zero_targets,
+                self.config.startup_zero_pose_duration_s,
+                "startup-zero",
+            )
+
+            first_targets = {
+                side: samples[0].positions_deg for side, samples in self._deployment_trajectories.items()
+            }
+            if self.config.startup_trajectory_blend_s > 0.0:
+                current = self._read_deployment_positions()
+                self._blend_deployment_positions(
+                    current,
+                    first_targets,
+                    self.config.startup_trajectory_blend_s,
+                    "startup-blend",
+                )
+
+            logger.info(
+                "Replaying task-ready OpenArm CSV trajectory at %.2fx...",
+                self.config.startup_trajectory_speed,
+            )
+            self._replay_deployment_trajectories(
+                self._deployment_trajectories,
+                self.config.startup_trajectory_speed,
+                "startup-replay",
+            )
+
+            # MIT gains are carried in each command. Re-send the same final pose
+            # once with policy gains so the gain transition cannot change pose.
+            final_action = {
+                f"{side}_{motor_name}.pos": position
+                for side, samples in self._deployment_trajectories.items()
+                for motor_name, position in zip(MOTOR_NAMES, samples[-1].positions_deg, strict=True)
+            }
+            self.send_action(final_action)
+        except Exception:
+            self._disable_both_arms()
+            raise
+
+        logger.info("OpenArm followers are task-ready; policy inference gains are active.")
+        return True
+
+    @staticmethod
+    def _confirm_shutdown_return() -> bool:
+        return confirm_openarm_motion(
+            "Return both OpenArm followers to motor zero? [yes/no]: ",
+            "Shutdown return was not confirmed; choosing no.",
+        )
+
+    def finish_policy_deployment(self) -> bool:
+        """Return task-ready followers along the reversed CSV path to exact motor zero."""
+        if not self.has_policy_deployment_trajectory:
+            return False
+
+        current = self._read_deployment_positions()
+        task_targets = {
+            side: samples[-1].positions_deg for side, samples in self._deployment_trajectories.items()
+        }
+        warnings: list[str] = []
+        for side in ("left", "right"):
+            for motor_name, actual, target in zip(
+                MOTOR_NAMES, current[side], task_targets[side], strict=True
+            ):
+                difference = abs(actual - target)
+                if difference > self.config.shutdown_task_pose_warn_deg:
+                    warnings.append(
+                        f"side={side} motor={motor_name} actual={actual:.3f} "
+                        f"task_ready={target:.3f} difference={difference:.3f} deg"
+                    )
+
+        if warnings:
+            logger.warning(
+                "One or more OpenArm joints are farther than %.3f deg from the task-ready pose:",
+                self.config.shutdown_task_pose_warn_deg,
+            )
+            for warning in warnings:
+                logger.warning("  %s", warning)
+            if not self._confirm_shutdown_return():
+                logger.info("Shutdown return declined; disabling motors in place.")
+                return True
+
+        try:
+            logger.info(
+                "Blending both OpenArm followers to the task-ready pose over %.1fs...",
+                self.config.shutdown_task_pose_blend_s,
+            )
+            self._blend_deployment_positions(
+                current,
+                task_targets,
+                self.config.shutdown_task_pose_blend_s,
+                "shutdown-task-pose",
+            )
+            return_trajectories = {
+                side: build_return_to_zero_trajectory(samples, self.config.shutdown_zero_transition_s)
+                for side, samples in self._deployment_trajectories.items()
+            }
+            logger.info(
+                "Replaying reversed OpenArm CSV trajectory to motor zero at %.2fx...",
+                self.config.shutdown_replay_speed,
+            )
+            self._replay_deployment_trajectories(
+                return_trajectories,
+                self.config.shutdown_replay_speed,
+                "shutdown-replay",
+            )
+        except Exception:
+            self._disable_both_arms()
+            raise
+
+        logger.info("Both OpenArm followers reached exact motor zero.")
+        return True
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -157,8 +463,12 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             key.removeprefix("right_"): value for key, value in action.items() if key.startswith("right_")
         }
 
-        sent_action_left = self.left_arm.send_action(left_action, custom_kp, custom_kd)
-        sent_action_right = self.right_arm.send_action(right_action, custom_kp, custom_kd)
+        try:
+            sent_action_left = self.left_arm.send_action(left_action, custom_kp, custom_kd)
+            sent_action_right = self.right_arm.send_action(right_action, custom_kp, custom_kd)
+        except Exception:
+            self._disable_both_arms()
+            raise
 
         # Add prefixes back
         prefixed_sent_action_left = {f"left_{key}": value for key, value in sent_action_left.items()}

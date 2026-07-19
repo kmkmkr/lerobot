@@ -122,20 +122,29 @@ class RolloutStrategy(abc.ABC):
             logger.info("Stopping inference engine...")
             self._engine.stop()
         robot = hw.robot_wrapper.inner
-        if robot.is_connected:
-            if return_to_initial_position and hw.initial_position:
-                logger.info("Returning robot to initial position before shutdown...")
-                self._return_to_initial_position(hw)
-            elif not return_to_initial_position:
-                logger.info(
-                    "Skipping return-to-initial-position (disabled by config); leaving robot in final pose."
-                )
-            logger.info("Disconnecting robot...")
-            robot.disconnect()
-        teleop = hw.teleop
-        if teleop is not None and teleop.is_connected:
-            logger.info("Disconnecting teleoperator...")
-            teleop.disconnect()
+        try:
+            if robot.is_connected:
+                try:
+                    if return_to_initial_position:
+                        finish_policy_deployment = getattr(robot, "finish_policy_deployment", None)
+                        specialized_return = (
+                            bool(finish_policy_deployment()) if callable(finish_policy_deployment) else False
+                        )
+                        if not specialized_return and hw.initial_position:
+                            logger.info("Returning robot to initial position before shutdown...")
+                            self._return_to_initial_position(hw)
+                    else:
+                        logger.info(
+                            "Skipping shutdown return motion (disabled by config); leaving robot in final pose."
+                        )
+                finally:
+                    logger.info("Disconnecting robot...")
+                    robot.disconnect()
+        finally:
+            teleop = hw.teleop
+            if teleop is not None and teleop.is_connected:
+                logger.info("Disconnecting teleoperator...")
+                teleop.disconnect()
 
     @staticmethod
     def _return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> None:
