@@ -175,6 +175,10 @@ deployment lifecycle is:
 5. If any shutdown joint differs from its task-ready position by more than the
    warning threshold, ask `yes/no` before moving. A non-interactive session
    chooses `no` and disables the motors in place.
+6. If the shutdown return itself fails, stop the motion and keep both followers
+   torque-enabled at their current pose by default. The subsequent cleanup
+   closes CAN and cameras without disabling torque, preventing the arms from
+   free-falling.
 
 ### Test Only The Home-Motion Round Trip
 
@@ -207,10 +211,12 @@ intentionally unattended test.
 It invokes `prepare_for_policy_deployment()` and
 `finish_policy_deployment()` directly, so its gains, compensation, trajectory
 validation, interpolation, tracking-error handling, and shutdown warning are
-the same as `lerobot-rollout`. It always attempts to disable and disconnect
-both arms after success or failure and rejects configurations that disable this
-safety behavior. If the process is interrupted, it disables and disconnects
-the arms without initiating another recovery motion.
+the same as `lerobot-rollout`. It requires torque-disable-on-disconnect at the
+start. After normal completion, startup failure, or interruption, it disables
+and disconnects both arms. A shutdown-return failure is handled differently:
+it refreshes a current-position hold command and disconnects CAN without
+disabling torque, so the arms remain energized after the command exits. Support
+both arms before removing power or manually disabling torque.
 
 After reinstalling or syncing the editable project, the equivalent console
 entry point is `lerobot-openarm-home-motion-test`.
@@ -251,6 +257,41 @@ PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
   --task="Pick up the red cube and place it in the tray" \
   --duration=60 \
   --display_data=false
+```
+
+短時間検証
+```
+cd ~/gitrepo/openarm-bilateral-teleop-lerobot-deploy/lerobot
+
+POLICY_PATH=/home/mkj/gitrepo/openarm-bilateral-teleop-lerobot-deploy/checkpoint/VLA-JEPA-OpenArm-lerobot-wrists
+PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
+
+./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-rollout \
+  --strategy.type=base \
+  --inference.type=sync \
+  --policy.path="$POLICY_PATH" \
+  --policy.qwen_model_name=Qwen/Qwen3-VL-2B-Instruct \
+  --policy.device=cuda \
+  --policy.n_action_steps=3 \
+  --device=cuda \
+  --robot.type=bi_openarm_follower \
+  --robot.left_arm_config.port=can3 \
+  --robot.left_arm_config.side=left \
+  --robot.left_arm_config.max_relative_target=2.0 \
+  --robot.left_arm_config.cameras='{wrist: {type: opencv, index_or_path: /dev/video8, width: 640, height: 480, fps: 30}}' \
+  --robot.right_arm_config.port=can2 \
+  --robot.right_arm_config.side=right \
+  --robot.right_arm_config.max_relative_target=2.0 \
+  --robot.right_arm_config.cameras='{wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}}' \
+  --robot.cameras='{front: {type: opencv, index_or_path: /dev/video6, width: 640, height: 480, fps: 30}}' \
+  --robot.id=openarm_v1_follower \
+  --robot.deployment_trajectory_profile="$PROFILE" \
+  --return_to_initial_position=true \
+  --task="Pick up the green gear and place it in the indentation on the white board." \
+  --fps=30 \
+  --duration=1.0 \
+  --display_data=false \
+  --play_sounds=false
 ```
 
 `trajectory_position_kp` and `trajectory_position_kd` apply only to the zero
@@ -294,12 +335,16 @@ Relevant motion settings and defaults are:
 | `robot.shutdown_replay_speed` | `0.25` | Reverse CSV speed scale |
 | `robot.shutdown_zero_transition_s` | `1.0` | Recorded-time transition from first sample to exact zero |
 | `robot.shutdown_task_pose_warn_deg` | `28.6479` | Confirmation threshold, equivalent to `0.5 rad` |
-| `robot.deployment_tracking_error_deg` | `20.0535` | Abort-and-disable threshold, equivalent to `0.35 rad` |
+| `robot.deployment_tracking_error_deg` | `20.0535` | Motion-abort threshold, equivalent to `0.35 rad` |
+| `robot.deployment_start_limit_tolerance_deg` | `1.0` | Maximum measured blend-start overshoot that may be clamped to a joint limit |
+| `robot.hold_position_on_shutdown_error` | `true` | Keep torque enabled at the current pose if the shutdown return fails |
 
 The zero transition is part of the reverse trajectory and is therefore also
 scaled by `shutdown_replay_speed`. Set `--return_to_initial_position=false` to
 skip the complete shutdown return and disable the followers in their final
-pose.
+pose. Set `--robot.hold_position_on_shutdown_error=false` only when the former
+abort-and-disable behavior is preferable to holding after a shutdown-return
+error.
 
 ## Teleoperate Without Recording
 

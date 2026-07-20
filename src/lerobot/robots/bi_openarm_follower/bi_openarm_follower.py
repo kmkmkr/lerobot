@@ -178,6 +178,49 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             except Exception as error:
                 logger.error("Failed to disable %s OpenArm after deployment motion error: %s", side, error)
 
+    def _hold_both_arms_after_shutdown_error(self) -> None:
+        """Keep the last MIT command active when the shutdown return fails."""
+        for side, arm_config, arm in (
+            ("left", self.config.left_arm_config, self.left_arm),
+            ("right", self.config.right_arm_config, self.right_arm),
+        ):
+            # The rollout and motion-test teardown still disconnect the CAN
+            # sockets. Prevent that cleanup from disabling torque after a
+            # failed return, which would otherwise let the arm free-fall.
+            arm_config.disable_torque_on_disconnect = False
+            arm.config.disable_torque_on_disconnect = False
+            if not arm.bus.is_connected:
+                logger.error("Cannot refresh the %s OpenArm hold command because its CAN bus is closed", side)
+                continue
+            try:
+                current = arm.get_motor_positions()
+                trajectory_kp, trajectory_kd = arm.trajectory_position_gains()
+                sent = arm.send_action(
+                    {f"{motor_name}.pos": current[motor_name] for motor_name in MOTOR_NAMES},
+                    custom_kp=trajectory_kp,
+                    custom_kd=trajectory_kd,
+                    apply_max_relative_target=False,
+                )
+                for motor_name in MOTOR_NAMES:
+                    requested = float(current[motor_name])
+                    actual = float(sent[f"{motor_name}.pos"])
+                    if not math.isclose(actual, requested, abs_tol=1e-6):
+                        logger.warning(
+                            "Clipped %s OpenArm shutdown hold target: motor=%s requested=%.3f sent=%.3f deg",
+                            side,
+                            motor_name,
+                            requested,
+                            actual,
+                        )
+            except Exception:
+                logger.exception("Failed to refresh the %s OpenArm hold command", side)
+
+        logger.critical(
+            "OpenArm shutdown return failed. Both followers will remain torque-enabled at their last "
+            "command when CAN is disconnected to prevent free-fall. Support the arms before removing "
+            "power or manually disabling torque."
+        )
+
     def _read_deployment_positions(self) -> dict[str, tuple[float, ...]]:
         left_positions = self.left_arm.get_motor_positions()
         right_positions = self.right_arm.get_motor_positions()
@@ -230,6 +273,49 @@ class BiOpenArmFollower(BimanualMixin, Robot):
                         f"actual={actual:.3f} error={tracking_error:.3f} limit={error_limit:.3f} deg"
                     )
 
+    def _clamp_measured_blend_start(
+        self,
+        start: dict[str, tuple[float, ...]],
+        phase: str,
+    ) -> dict[str, tuple[float, ...]]:
+        """Clamp only small encoder overshoots before interpolating a measured pose."""
+        clamped: dict[str, tuple[float, ...]] = {}
+        tolerance = self.config.deployment_start_limit_tolerance_deg
+        for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
+            joint_limits = arm.config.joint_limits
+            assert joint_limits is not None
+            side_positions: list[float] = []
+            for motor_name, position in zip(MOTOR_NAMES, start[side], strict=True):
+                if not math.isfinite(position):
+                    raise RuntimeError(
+                        f"OpenArm deployment blend start is not finite: side={side} phase={phase} "
+                        f"motor={motor_name} actual={position}"
+                    )
+                minimum, maximum = joint_limits[motor_name]
+                bounded = min(max(position, minimum), maximum)
+                excess = abs(position - bounded)
+                if excess > tolerance:
+                    raise RuntimeError(
+                        f"OpenArm deployment blend start exceeds the joint limit: side={side} "
+                        f"phase={phase} motor={motor_name} actual={position:.3f} "
+                        f"limit=[{minimum:.3f}, {maximum:.3f}] excess={excess:.3f} "
+                        f"tolerance={tolerance:.3f} deg"
+                    )
+                if excess > 0.0:
+                    logger.warning(
+                        "Clamping measured OpenArm blend start to its joint limit: side=%s phase=%s "
+                        "motor=%s actual=%.3f clamped=%.3f excess=%.3f deg",
+                        side,
+                        phase,
+                        motor_name,
+                        position,
+                        bounded,
+                        excess,
+                    )
+                side_positions.append(bounded)
+            clamped[side] = tuple(side_positions)
+        return clamped
+
     def _blend_deployment_positions(
         self,
         start: dict[str, tuple[float, ...]],
@@ -240,6 +326,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
         if duration_s <= 0.0:
             self._send_deployment_targets(target, phase=phase, reference_time_s=0.0)
             return
+        start = self._clamp_measured_blend_start(start, phase)
         steps = max(math.ceil(duration_s * self.config.deployment_control_frequency_hz), 1)
         start_time = time.perf_counter()
         for step in range(1, steps + 1):
@@ -346,34 +433,34 @@ class BiOpenArmFollower(BimanualMixin, Robot):
         if not self.has_policy_deployment_trajectory:
             return False
 
-        current = self._read_deployment_positions()
-        task_targets = {
-            side: samples[-1].positions_deg for side, samples in self._deployment_trajectories.items()
-        }
-        warnings: list[str] = []
-        for side in ("left", "right"):
-            for motor_name, actual, target in zip(
-                MOTOR_NAMES, current[side], task_targets[side], strict=True
-            ):
-                difference = abs(actual - target)
-                if difference > self.config.shutdown_task_pose_warn_deg:
-                    warnings.append(
-                        f"side={side} motor={motor_name} actual={actual:.3f} "
-                        f"task_ready={target:.3f} difference={difference:.3f} deg"
-                    )
-
-        if warnings:
-            logger.warning(
-                "One or more OpenArm joints are farther than %.3f deg from the task-ready pose:",
-                self.config.shutdown_task_pose_warn_deg,
-            )
-            for warning in warnings:
-                logger.warning("  %s", warning)
-            if not self._confirm_shutdown_return():
-                logger.info("Shutdown return declined; disabling motors in place.")
-                return True
-
         try:
+            current = self._read_deployment_positions()
+            task_targets = {
+                side: samples[-1].positions_deg for side, samples in self._deployment_trajectories.items()
+            }
+            warnings: list[str] = []
+            for side in ("left", "right"):
+                for motor_name, actual, target in zip(
+                    MOTOR_NAMES, current[side], task_targets[side], strict=True
+                ):
+                    difference = abs(actual - target)
+                    if difference > self.config.shutdown_task_pose_warn_deg:
+                        warnings.append(
+                            f"side={side} motor={motor_name} actual={actual:.3f} "
+                            f"task_ready={target:.3f} difference={difference:.3f} deg"
+                        )
+
+            if warnings:
+                logger.warning(
+                    "One or more OpenArm joints are farther than %.3f deg from the task-ready pose:",
+                    self.config.shutdown_task_pose_warn_deg,
+                )
+                for warning in warnings:
+                    logger.warning("  %s", warning)
+                if not self._confirm_shutdown_return():
+                    logger.info("Shutdown return declined; disabling motors in place.")
+                    return True
+
             logger.info(
                 "Blending both OpenArm followers to the task-ready pose over %.1fs...",
                 self.config.shutdown_task_pose_blend_s,
@@ -398,7 +485,10 @@ class BiOpenArmFollower(BimanualMixin, Robot):
                 "shutdown-replay",
             )
         except Exception:
-            self._disable_both_arms()
+            if self.config.hold_position_on_shutdown_error:
+                self._hold_both_arms_after_shutdown_error()
+            else:
+                self._disable_both_arms()
             raise
 
         logger.info("Both OpenArm followers reached exact motor zero.")

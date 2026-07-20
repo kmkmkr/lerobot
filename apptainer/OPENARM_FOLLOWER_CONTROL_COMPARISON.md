@@ -18,7 +18,7 @@ LeRobotの公開actionと関節制限はmotor-zero基準のdegreeで扱われま
 | Dora bilateral teleop | native follower用PD | あり | あり | 通常テレオペ中は後述のCSV用関節制限でclipしない。送信前にDamiao motor固有のMIT制御範囲を検査し、違反時はモータをdisableする |
 | Dora 姿勢移動CSV再生 | 原則としてbilateral teleopと同じPD | 原則としてあり | 原則としてあり | 再生開始前にnative側の関節角度・速度制限でCSVを検証する。再生中のtracking error上限は`0.35 rad` |
 | LeRobot policyデプロイ | bilateral followerと同じPD | あり | あり | 左右別の安全制限内へ各actionをclipする。`max_relative_target`は既定で無効 |
-| LeRobot 姿勢移動CSV再生 | bilateral followerと同じPD | あり | あり | CSVを左右別の安全制限で事前検証し、送信時にも同じ範囲へclipする。clipを検出した場合、またはtracking errorが`20.0535 deg`（`0.35 rad`）を超えた場合は再生を中止して両followerをdisableする |
+| LeRobot 姿勢移動CSV再生 | bilateral followerと同じPD | あり | あり | CSVを左右別の制限で事前検証し、送信時にも同じ範囲へclipする。clipまたはtracking errorを検出すると再生を中止する。起動時エラーは両followerをdisableし、終了復帰時エラーは既定で現在姿勢を保持してCAN切断時もトルクを維持する |
 
 LeRobotではpolicy推論とCSV再生のPDゲインを独立して設定できますが、既定値はどちらも
 native bilateral followerを正として同じ値に揃えています。MIT制御コマンドの速度目標は
@@ -114,9 +114,9 @@ CSVのサンプル間速度も全関節で`8 rad/s`以下か検証します。�
 `-pMax`から`pMax`までを超えた指令を拒否します。
 
 収録後のLeRobot dataset変換では、既定の`LEROBOT_LIMIT_POLICY=warn`により下記の
-LeRobot安全制限に対する監査も行います。これは収録中の実時間制御やclipではありません。
+LeRobotデプロイ制限に対する監査も行います。これは収録中の実時間制御やclipではありません。
 
-### LeRobotの左右別安全範囲
+### LeRobotの左右別デプロイ範囲
 
 単位はmotor-zero基準のdegreeです。policy actionと姿勢移動CSVの両方に同じ範囲を
 使用します。
@@ -124,18 +124,31 @@ LeRobot安全制限に対する監査も行います。これは収録中の実�
 | 関節 | 左follower最小 | 左follower最大 | 右follower最小 | 右follower最大 |
 | --- | ---: | ---: | ---: | ---: |
 | J1 | `-75` | `75` | `-75` | `75` |
-| J2 | `-90` | `9` | `-9` | `90` |
-| J3 | `-85` | `85` | `-85` | `85` |
-| J4 | `0` | `135` | `0` | `135` |
-| J5 | `-85` | `85` | `-85` | `85` |
-| J6 | `-40` | `40` | `-40` | `40` |
-| J7 | `-80` | `80` | `-80` | `80` |
+| J2 | `-90` | `10` | `-10` | `90` |
+| J3 | `-90` | `90` | `-90` | `90` |
+| J4 | `0` | `140` | `0` | `140` |
+| J5 | `-90` | `90` | `-90` | `90` |
+| J6 | `-45` | `45` | `-45` | `45` |
+| J7 | `-90` | `90` | `-90` | `90` |
 | gripper | `-60` | `0` | `-60` | `0` |
 
 policy actionは範囲外の場合に境界値へclipされます。姿勢移動CSVは再生前に全サンプルを
 検証するため、範囲外のCSVはモータを動かす前に拒否されます。また、再生時にも通常の
 `send_action()`を経由するためclipが適用されますが、要求値と実際の送信値の不一致を
 検出すると安全上のエラーとして再生を中止します。
+
+J1はタスク空間上の制約として左右とも`-75`から`75 deg`を維持し、J2も外向き方向は
+左右それぞれ`-90`または`90 deg`までに制限します。J3からJ7はOpenArm Description
+v1.0.4の機械的範囲まで拡大しています。blend開始時に読み取った関節角がこの範囲を
+既定`1 deg`以内だけ越えている場合は境界値へ丸めます。それ以上の逸脱は動作を開始せず
+エラーにします。
+
+終了復帰中のエラーでは、自由落下を避けるため、既定で測定中の現在姿勢をtrajectory用
+PDで再指令し、後続のCAN切断でもトルクをdisableしません。プロセス終了後もアームは
+通電・保持状態となるため、電源断または手動disableの前に必ず両アームを支えてください。
+従来どおりエラー時にdisableする必要がある場合は
+`robot.hold_position_on_shutdown_error=false`を指定します。起動時の姿勢移動エラーと
+policy action送信エラーは引き続き両followerをdisableします。
 
 ## 設定・実装の参照先
 

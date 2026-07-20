@@ -230,6 +230,16 @@ def test_side_selects_v1_safe_limits_without_sharing_mutable_state(tmp_path):
     assert robot.config.coordinate_frame == OPENARM_V1_COORDINATE_FRAME
     assert robot.config.joint_limits == OPENARM_V1_SAFE_JOINT_LIMITS["left"]
     assert robot.config.joint_limits is not OPENARM_V1_SAFE_JOINT_LIMITS["left"]
+    assert robot.config.joint_limits == {
+        "joint_1": (-75.0, 75.0),
+        "joint_2": (-90.0, 10.0),
+        "joint_3": (-90.0, 90.0),
+        "joint_4": (0.0, 140.0),
+        "joint_5": (-90.0, 90.0),
+        "joint_6": (-45.0, 45.0),
+        "joint_7": (-90.0, 90.0),
+        "gripper": (-60.0, 0.0),
+    }
     assert robot.config.joint_limits["gripper"] == (-60.0, 0.0)
 
 
@@ -274,8 +284,8 @@ def test_send_action_clips_in_v1_motor_zero_degrees(tmp_path):
 
     sent = robot.send_action({"joint_6.pos": -46.0})
 
-    assert sent == {"joint_6.pos": -40.0}
-    assert bus._mit_control_batch.call_args.args[0]["joint_6"][2] == -40.0
+    assert sent == {"joint_6.pos": -45.0}
+    assert bus._mit_control_batch.call_args.args[0]["joint_6"][2] == -45.0
 
 
 def test_trajectory_commands_use_gains_separate_from_policy_actions(tmp_path):

@@ -53,6 +53,8 @@ class BiOpenArmFollowerConfig(RobotConfig):
     shutdown_zero_transition_s: float = 1.0
     shutdown_task_pose_warn_deg: float = math.degrees(0.5)
     deployment_tracking_error_deg: float = math.degrees(0.35)
+    deployment_start_limit_tolerance_deg: float = 1.0
+    hold_position_on_shutdown_error: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -69,6 +71,11 @@ class BiOpenArmFollowerConfig(RobotConfig):
             "shutdown_zero_transition_s": (self.shutdown_zero_transition_s, 0.1, 10.0),
             "shutdown_task_pose_warn_deg": (self.shutdown_task_pose_warn_deg, math.degrees(0.1), 180.0),
             "deployment_tracking_error_deg": (self.deployment_tracking_error_deg, 1.0, 90.0),
+            "deployment_start_limit_tolerance_deg": (
+                self.deployment_start_limit_tolerance_deg,
+                0.0,
+                10.0,
+            ),
         }
         for name, (value, minimum, maximum) in bounded_values.items():
             if not math.isfinite(value) or not minimum <= value <= maximum:

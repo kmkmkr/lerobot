@@ -73,28 +73,29 @@ OPENARM_V1_PHYSICAL_JOINT_LIMITS: dict[str, dict[str, tuple[float, float]]] = {
     },
 }
 
-# Conservative deployment limits. These deliberately remain inside the v1
-# physical limits. They are also consumed by the OpenArmDataset converter so
-# collection and deployment are audited against the same coordinate contract.
+# Deployment limits. J1 and the outward J2 direction keep task-space
+# restrictions, while J3-J7 use the OpenArm v1 physical range. They are also
+# consumed by the OpenArmDataset converter so collection and deployment are
+# audited against the same coordinate contract.
 LEFT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
     "joint_1": (-75.0, 75.0),
-    "joint_2": (-90.0, 9.0),
-    "joint_3": (-85.0, 85.0),
-    "joint_4": (0.0, 135.0),
-    "joint_5": (-85.0, 85.0),
-    "joint_6": (-40.0, 40.0),
-    "joint_7": (-80.0, 80.0),
+    "joint_2": (-90.0, 10.0),
+    "joint_3": (-90.0, 90.0),
+    "joint_4": (0.0, 140.0),
+    "joint_5": (-90.0, 90.0),
+    "joint_6": (-45.0, 45.0),
+    "joint_7": (-90.0, 90.0),
     "gripper": (-60.0, 0.0),
 }
 
 RIGHT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
     "joint_1": (-75.0, 75.0),
-    "joint_2": (-9.0, 90.0),
-    "joint_3": (-85.0, 85.0),
-    "joint_4": (0.0, 135.0),
-    "joint_5": (-85.0, 85.0),
-    "joint_6": (-40.0, 40.0),
-    "joint_7": (-80.0, 80.0),
+    "joint_2": (-10.0, 90.0),
+    "joint_3": (-90.0, 90.0),
+    "joint_4": (0.0, 140.0),
+    "joint_5": (-90.0, 90.0),
+    "joint_6": (-45.0, 45.0),
+    "joint_7": (-90.0, 90.0),
     "gripper": (-60.0, 0.0),
 }
 
