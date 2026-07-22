@@ -12,16 +12,17 @@ The container includes:
 It intentionally does not install LeRobot Python dependencies at image build
 time. Run `uv sync` inside the container after binding this repository.
 
-In this project, task demonstrations are collected with the native bilateral
-controller in `dora-openarm-data-collection`. LeRobot is used for training and
-policy deployment. The LeRobot teleoperation and recording commands below are
-useful diagnostics or alternatives, but they do not replace the bilateral Dora
-collection path.
+In this project, the native bilateral controller in
+`dora-openarm-data-collection` remains the canonical collection path. LeRobot
+is used for training and policy deployment, and its teleoperation/recording
+commands below now provide bilateral OpenArm leader feedback using the same
+role-specific PD gains and compensation defaults. The LeRobot path remains a
+lower-frequency diagnostic or alternative to the native controller.
 
 See [OPENARM_FOLLOWER_CONTROL_COMPARISON.md](OPENARM_FOLLOWER_CONTROL_COMPARISON.md)
-for a comparison of follower PD gains, gravity/friction compensation, and joint
-limits across bilateral collection, policy inference, and their startup/shutdown
-trajectory motions.
+for a comparison of leader/follower PD gains, gravity/friction compensation,
+and joint limits across bilateral collection, policy inference, and their
+startup/shutdown trajectory motions.
 
 ## Build
 
@@ -131,9 +132,9 @@ this workstation. Recheck it after changing USB-CAN adapters or cables:
 
 LeRobot does not discover these roles from the motor. A port passed under
 `robot.*` is configured as the torque-enabled follower, while a port passed
-under `teleop.*` is configured as the manually moved leader. If moving a
-physical follower makes a physical leader move, stop immediately and correct
-the port assignments.
+under `teleop.*` is configured as the torque-enabled bilateral leader. Verify
+all four adapter-to-arm assignments before connecting; a swapped role or side
+can send feedback to the wrong physical device.
 
 ## OpenArm Motor-Zero Calibration
 
@@ -263,7 +264,7 @@ PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
 ```
 cd ~/gitrepo/openarm-bilateral-teleop-lerobot-deploy/lerobot
 
-POLICY_PATH=/home/mkj/gitrepo/openarm-bilateral-teleop-lerobot-deploy/checkpoint/VLA-JEPA-OpenArm-lerobot-wrists
+POLICY_PATH=/home/mkj/gitrepo/openarm-bilateral-teleop-lerobot-deploy/checkpoint/VLA-JEPA-OpenArm-lerobot-merged-wrists-20k
 PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
 
 ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-rollout \
@@ -287,10 +288,10 @@ PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
   --robot.id=openarm_v1_follower \
   --robot.deployment_trajectory_profile="$PROFILE" \
   --return_to_initial_position=true \
-  --task="Pick up the green gear and place it in the indentation on the white board." \
+  --task="Pick up the large green gear and place it in the red recessed area of the blue board." \
   --fps=30 \
   --duration=1.0 \
-  --display_data=false \
+  --display_data=true \
   --play_sounds=false
 ```
 
@@ -303,13 +304,14 @@ Likewise, `max_relative_target` limits policy actions but is deliberately not
 applied to the validated zero/CSV deployment trajectory, which already has
 joint-limit, velocity, exact-target clipping, and tracking-error checks.
 
-LeRobot also applies the native follower's gravity and friction feed-forward
-terms during policy inference and trajectory motions. The wrapper generates a
-v10 bimanual URDF from the sibling native `openarm_teleop.sif` on every launch,
-then binds it read-only into the LeRobot container. This ensures the Python
-gravity model consumes the same OpenArm Description 1.0.4 model as the native
-KDL controller. Override the source image or provide an already generated host
-URDF when needed:
+LeRobot also applies the native role-specific gravity and friction feed-forward
+terms: to leaders during bilateral teleoperation/recording, and to followers
+during teleoperation, policy inference, and trajectory motions. The wrapper
+generates a v10 bimanual URDF from the sibling native `openarm_teleop.sif` on
+every launch, then binds it read-only into the LeRobot container. This ensures
+the Python gravity model consumes the same OpenArm Description 1.0.4 model as
+the native KDL controller. Override the source image or provide an already
+generated host URDF when needed:
 
 ```bash
 LEROBOT_OPENARM_TELEOP_IMAGE=/absolute/path/to/openarm_teleop.sif \
@@ -320,8 +322,8 @@ LEROBOT_OPENARM_DYNAMICS_URDF=/absolute/path/to/v10_bimanual.urdf \
 ```
 
 `LEROBOT_OPENARM_ENABLE_COMPENSATION=0` disables both gravity and friction
-compensation. It is intended only for diagnosis; the normal deployment default
-is enabled.
+compensation for both leaders and followers. It is intended only for diagnosis;
+the normal bilateral and deployment defaults are enabled.
 
 Relevant motion settings and defaults are:
 
@@ -348,9 +350,10 @@ error.
 
 ## Teleoperate Without Recording
 
-This is LeRobot unilateral leader-follower teleoperation. It mirrors leader
-joint positions to follower joint targets and does not provide bilateral force
-feedback.
+This is LeRobot bilateral leader-follower teleoperation. Each cycle reads the
+follower observation, reads the leader action, sends the follower pose back to
+the leader with the native leader PD/compensation defaults, and sends the leader
+pose to the follower with the native follower defaults.
 
 ```bash
 ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-teleoperate \
@@ -375,9 +378,15 @@ Start with conservative limits if this is a first run:
   --robot.right_arm_config.max_relative_target=1.0
 ```
 
-Align each leader and follower in a similar safe pose before connecting. The
-relative-target limit is useful for a first motion test, but it is not a
-zero-position or pose-alignment procedure.
+Support all arms and align each leader/follower pair in a similar safe pose
+before connecting. Unlike the native Dora startup flow, this command does not
+move all devices through the synchronized zero/CSV startup trajectory. The
+relative-target limit is useful for a first follower motion test, but it is not
+a zero-position or pose-alignment procedure.
+
+For a torque-disabled leader diagnostic, set both
+`--teleop.{left,right}_arm_config.manual_control=true`. This removes the leader
+feedback features, PD, and compensation; it is not bilateral operation.
 
 ## Record A LeRobot Dataset
 
@@ -429,10 +438,16 @@ OpenCV camera, replace the RealSense configuration, for example:
 
 ## Notes On Bilateral Control
 
-OpenArm's native bilateral controller provides two-way force feedback. LeRobot's
-current OpenArm leader implementation exposes no `feedback_features`, and
-`send_feedback` is not implemented for `openarm_leader`. For LeRobot-format data
-collection, use the LeRobot unilateral path above. If force-feedback teleop is
-required during collection, bridge or port the OpenArm bilateral controller so
-the commanded/sent follower actions and observations are also written through
-`LeRobotDataset`.
+`openarm_leader` and `bi_openarm_leader` expose follower position feedback and
+issue leader MIT commands with the effective native leader `Kp`, `Kd`, gravity,
+and friction values. In bimanual mode, a feedback/compensation failure disables
+both leaders. The dynamics URDF for both sides is validated before either
+leader is enabled.
+
+The standard LeRobot OpenArm dataset commands are position-only by default, so
+the MIT reference velocity is `0`; if a follower observation supplies `.vel`,
+`send_feedback` uses it. The loop also runs at the configured dataset/teleop
+FPS (typically 30 Hz), not the native controller's high-rate control loop.
+Consequently the native Dora controller remains the reference for collection
+feel and hardware validation even though the default gains and feed-forward
+equations are synchronized numerically.

@@ -19,7 +19,7 @@ from functools import cached_property
 
 from lerobot.types import RobotAction
 from lerobot.utils.bimanual import BimanualMixin
-from lerobot.utils.decorators import check_if_not_connected
+from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..openarm_leader import OpenArmLeader, OpenArmLeaderConfig
 from ..teleoperator import Teleoperator
@@ -40,34 +40,75 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
         super().__init__(config)
         self.config = config
 
+        if config.left_arm_config.side not in (None, "left"):
+            raise ValueError("left_arm_config.side must be 'left' when provided")
+        if config.right_arm_config.side not in (None, "right"):
+            raise ValueError("right_arm_config.side must be 'right' when provided")
+        if config.left_arm_config.manual_control != config.right_arm_config.manual_control:
+            raise ValueError("left and right OpenArm leaders must use the same manual_control mode")
+
         left_arm_config = OpenArmLeaderConfig(
             id=f"{config.id}_left" if config.id else None,
             calibration_dir=config.calibration_dir,
             port=config.left_arm_config.port,
+            side="left",
+            coordinate_frame=config.left_arm_config.coordinate_frame,
             can_interface=config.left_arm_config.can_interface,
             use_can_fd=config.left_arm_config.use_can_fd,
             can_bitrate=config.left_arm_config.can_bitrate,
             can_data_bitrate=config.left_arm_config.can_data_bitrate,
             motor_config=config.left_arm_config.motor_config,
             manual_control=config.left_arm_config.manual_control,
+            disable_torque_on_disconnect=config.left_arm_config.disable_torque_on_disconnect,
             use_velocity_and_torque=config.left_arm_config.use_velocity_and_torque,
             position_kd=config.left_arm_config.position_kd,
             position_kp=config.left_arm_config.position_kp,
+            gravity_compensation=config.left_arm_config.gravity_compensation,
+            friction_compensation=config.left_arm_config.friction_compensation,
+            dynamics_urdf_path=config.left_arm_config.dynamics_urdf_path,
+            compensation_state_max_age_s=config.left_arm_config.compensation_state_max_age_s,
+            gravity_m_s2=config.left_arm_config.gravity_m_s2,
+            gravity_scale=config.left_arm_config.gravity_scale,
+            friction_tanh_coefficient=config.left_arm_config.friction_tanh_coefficient,
+            friction_fc=config.left_arm_config.friction_fc,
+            friction_k=config.left_arm_config.friction_k,
+            friction_fv=config.left_arm_config.friction_fv,
+            friction_fo=config.left_arm_config.friction_fo,
+            friction_fc_scale=config.left_arm_config.friction_fc_scale,
+            friction_fv_scale=config.left_arm_config.friction_fv_scale,
+            friction_fo_scale=config.left_arm_config.friction_fo_scale,
         )
 
         right_arm_config = OpenArmLeaderConfig(
             id=f"{config.id}_right" if config.id else None,
             calibration_dir=config.calibration_dir,
             port=config.right_arm_config.port,
+            side="right",
+            coordinate_frame=config.right_arm_config.coordinate_frame,
             can_interface=config.right_arm_config.can_interface,
             use_can_fd=config.right_arm_config.use_can_fd,
             can_bitrate=config.right_arm_config.can_bitrate,
             can_data_bitrate=config.right_arm_config.can_data_bitrate,
             motor_config=config.right_arm_config.motor_config,
             manual_control=config.right_arm_config.manual_control,
+            disable_torque_on_disconnect=config.right_arm_config.disable_torque_on_disconnect,
             use_velocity_and_torque=config.right_arm_config.use_velocity_and_torque,
             position_kd=config.right_arm_config.position_kd,
             position_kp=config.right_arm_config.position_kp,
+            gravity_compensation=config.right_arm_config.gravity_compensation,
+            friction_compensation=config.right_arm_config.friction_compensation,
+            dynamics_urdf_path=config.right_arm_config.dynamics_urdf_path,
+            compensation_state_max_age_s=config.right_arm_config.compensation_state_max_age_s,
+            gravity_m_s2=config.right_arm_config.gravity_m_s2,
+            gravity_scale=config.right_arm_config.gravity_scale,
+            friction_tanh_coefficient=config.right_arm_config.friction_tanh_coefficient,
+            friction_fc=config.right_arm_config.friction_fc,
+            friction_k=config.right_arm_config.friction_k,
+            friction_fv=config.right_arm_config.friction_fv,
+            friction_fo=config.right_arm_config.friction_fo,
+            friction_fc_scale=config.right_arm_config.friction_fc_scale,
+            friction_fv_scale=config.right_arm_config.friction_fv_scale,
+            friction_fo_scale=config.right_arm_config.friction_fo_scale,
         )
 
         self.left_arm = OpenArmLeader(left_arm_config)
@@ -85,12 +126,39 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
 
     @cached_property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        return {
+            **{f"left_{k}": v for k, v in self.left_arm.feedback_features.items()},
+            **{f"right_{k}": v for k, v in self.right_arm.feedback_features.items()},
+        }
+
+    @property
+    def requires_continuous_feedback(self) -> bool:
+        return self.left_arm.requires_continuous_feedback and self.right_arm.requires_continuous_feedback
 
     def setup_motors(self) -> None:
         raise NotImplementedError(
             "Motor ID configuration is typically done via manufacturer tools for CAN motors."
         )
+
+    @check_if_already_connected
+    def connect(self, calibrate: bool = True) -> None:
+        """Preflight both dynamics chains before enabling either leader."""
+        self.left_arm._prepare_gravity_model()
+        self.right_arm._prepare_gravity_model()
+        try:
+            self.left_arm.connect(calibrate)
+            self.right_arm.connect(calibrate)
+        except Exception:
+            for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
+                if not arm.bus.is_connected:
+                    continue
+                try:
+                    arm.disconnect()
+                except Exception as error:
+                    logger.error(
+                        "Failed to disconnect %s OpenArm leader after connect error: %s", side, error
+                    )
+            raise
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
@@ -107,5 +175,32 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
         return action_dict
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO: Implement force feedback
-        raise NotImplementedError
+        left_feedback = {
+            key.removeprefix("left_"): value for key, value in feedback.items() if key.startswith("left_")
+        }
+        right_feedback = {
+            key.removeprefix("right_"): value for key, value in feedback.items() if key.startswith("right_")
+        }
+        try:
+            self.left_arm.send_feedback(left_feedback)
+            self.right_arm.send_feedback(right_feedback)
+        except Exception:
+            self.disable_torque()
+            raise
+
+    @check_if_not_connected
+    def disable_torque(self) -> None:
+        for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
+            try:
+                arm.disable_torque()
+            except Exception as error:
+                logger.error("Failed to disable %s OpenArm leader torque: %s", side, error)
+
+    @check_if_not_connected
+    def enable_torque(self) -> None:
+        try:
+            self.left_arm.enable_torque()
+            self.right_arm.enable_torque()
+        except Exception:
+            self.disable_torque()
+            raise

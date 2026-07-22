@@ -200,6 +200,9 @@ def teleop_loop(
         # Get teleop action
         raw_action = teleop.get_action()
 
+        if getattr(teleop, "requires_continuous_feedback", False):
+            teleop.send_feedback(obs)
+
         # Process teleop action through pipeline
         teleop_action = teleop_action_processor((raw_action, obs))
 

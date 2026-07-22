@@ -1,11 +1,12 @@
-# OpenArm follower制御設定の比較
+# OpenArm leader/follower制御設定の比較
 
-この文書は、次の4つの動作におけるOpenArm followerの制御設定を比較したものです。
+この文書は、次の5つの動作におけるOpenArm leader/followerの制御設定を比較したものです。
 
 1. `dora-openarm-data-collection`でのbilateral teleop
 2. bilateral teleop起動・終了時の姿勢移動CSV再生
-3. LeRobotでのpolicyデプロイ（推論中）
-4. LeRobot起動・終了時の姿勢移動CSV再生
+3. LeRobotでのbilateral teleop・データ収集
+4. LeRobotでのpolicyデプロイ（推論中）
+5. LeRobot起動・終了時の姿勢移動CSV再生
 
 値は現在の作業ツリーにおける既定値です。配列と表の関節順序は
 `J1, J2, J3, J4, J5, J6, J7, gripper`です。Dora/native側の位置はrad、
@@ -15,16 +16,18 @@ LeRobotの公開actionと関節制限はmotor-zero基準のdegreeで扱われま
 
 | 動作 | PDゲイン | 重力補償 | 摩擦補償 | 関節角度の扱い |
 | --- | --- | --- | --- | --- |
-| Dora bilateral teleop | native follower用PD | あり | あり | 通常テレオペ中は後述のCSV用関節制限でclipしない。送信前にDamiao motor固有のMIT制御範囲を検査し、違反時はモータをdisableする |
+| Dora bilateral teleop | nativeのrole別PD | あり | あり | 通常テレオペ中は後述のCSV用関節制限でclipしない。送信前にDamiao motor固有のMIT制御範囲を検査し、違反時はモータをdisableする |
 | Dora 姿勢移動CSV再生 | 原則としてbilateral teleopと同じPD | 原則としてあり | 原則としてあり | 再生開始前にnative側の関節角度・速度制限でCSVを検証する。再生中のtracking error上限は`0.35 rad` |
+| LeRobot bilateral teleop・収集 | nativeのrole別PD | あり | あり | follower actionは左右別安全範囲へclipする。leader feedbackはOpenArm Descriptionの左右別物理範囲を外れると拒否し、bimanual feedbackエラーでは両leaderをdisableする |
 | LeRobot policyデプロイ | bilateral followerと同じPD | あり | あり | 左右別の安全制限内へ各actionをclipする。`max_relative_target`は既定で無効 |
 | LeRobot 姿勢移動CSV再生 | bilateral followerと同じPD | あり | あり | CSVを左右別の制限で事前検証し、送信時にも同じ範囲へclipする。clipまたはtracking errorを検出すると再生を中止する。起動時エラーは両followerをdisableし、終了復帰時エラーは既定で現在姿勢を保持してCAN切断時もトルクを維持する |
 
-LeRobotではpolicy推論とCSV再生のPDゲインを独立して設定できますが、既定値はどちらも
-native bilateral followerを正として同じ値に揃えています。MIT制御コマンドの速度目標は
-`0`、トルクフィードフォワードはnativeと同じ重力補償と摩擦補償の和です。
+LeRobotではleader feedback、policy推論、CSV再生のPDゲインを独立して設定できます。
+既定値はそれぞれnative bilateralの同じroleを正として揃えています。位置のみの標準構成では
+MIT制御コマンドの速度目標は`0`、トルクフィードフォワードはnativeと同じ重力補償と
+摩擦補償の和です。follower観測に`.vel`が含まれる場合、leader feedbackはその速度も参照します。
 
-## PDゲイン
+## follower PDゲイン
 
 各セルは`Kp / Kd`です。
 
@@ -32,6 +35,7 @@ native bilateral followerを正として同じ値に揃えています。MIT制�
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Dora bilateral teleop | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 | Dora 姿勢移動CSV再生 | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
+| LeRobot bilateral teleop・収集 | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 | LeRobot policyデプロイ | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 | LeRobot 姿勢移動CSV再生 | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 
@@ -40,6 +44,19 @@ LeRobotでは次のオプションがそれぞれ対応します。
 
 - policy推論: `robot.{left,right}_arm_config.position_kp`、`position_kd`
 - CSV再生: `robot.{left,right}_arm_config.trajectory_position_kp`、`trajectory_position_kd`
+
+## leader PDゲイン
+
+LeRobot bilateral teleop・収集では、各followerの観測姿勢を同じ側のleader参照姿勢として
+`teleop.{left,right}_arm_config.position_kp`、`position_kd`でMIT指令へ変換します。
+
+| 動作 | J1 | J2 | J3 | J4 | J5 | J6 | J7 | gripper |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Dora bilateral teleop | `192 / 3` | `192 / 3` | `192 / 3` | `96 / 3` | `19.2 / 0.2` | `24.8 / 0.2` | `20 / 0.2` | `16 / 0.2` |
+| LeRobot bilateral teleop・収集 | `192 / 3` | `192 / 3` | `192 / 3` | `96 / 3` | `19.2 / 0.2` | `24.8 / 0.2` | `20 / 0.2` | `16 / 0.2` |
+
+Doraの既定`J7_TUNING_PROFILE=validated`はleader J7を`Kp=20`にします。現在の
+`leader.yaml`も同じ値を持つため、LeRobotの実効既定値も`20 / 0.2`です。
 
 ### Dora起動時のゼロ姿勢移動の例外
 
@@ -61,6 +78,7 @@ followerは通常のbilateral PDではなく、次の低いゲインを使用し
 | --- | --- | --- | --- |
 | Dora bilateral teleop | `gravity + friction` | `friction` | なし（計算するが指令には加算しない） |
 | Dora 姿勢移動CSV再生 | `gravity + friction` | `friction` | なし（現在姿勢からホーム姿勢までの例外区間は全項目`0`） |
+| LeRobot bilateral teleop・収集（leader/follower） | `gravity + friction` | `friction` | なし |
 | LeRobot policyデプロイ | `gravity + friction` | `friction` | なし |
 | LeRobot 姿勢移動CSV再生 | `gravity + friction` | `friction` | なし |
 
@@ -70,11 +88,11 @@ Dora/nativeの摩擦モデルは、関節速度を`dq`として次式です。
 friction = Fc * tanh(0.1 * k * dq) + Fv * dq + Fo
 ```
 
-通常起動時の`J7_TUNING_PROFILE=validated`では、左右followerのJ7に次のscaleが
+通常起動時の`J7_TUNING_PROFILE=validated`では、左右leader/followerのJ7に次のscaleが
 適用されます。J1〜J6のscaleは`1.0`で、gripperは重力補償を持たず、設定ファイルの
 摩擦パラメータをそのまま使用します。
 
-| follower J7項目 | follower.yaml値 | scale | 実効値 |
+| J7項目 | leader/follower YAML値 | scale | 実効値 |
 | --- | ---: | ---: | ---: |
 | 重力 | dynamicsによる計算値 | `0.95` | `0.95 * gravity` |
 | `Fc` | `0.172 Nm` | `0.25` | `0.043 Nm` |
@@ -83,13 +101,14 @@ friction = Fc * tanh(0.1 * k * dq) + Fv * dq + Fo
 | `Fo` | `-0.059 Nm` | `0.15` | `-0.00885 Nm` |
 
 `J7_TUNING_PROFILE=official`を指定した場合、これらのJ7 scale overrideは適用されず、
-`follower.yaml`の値が使用されます。
+roleごとのYAML値が使用されます。
 
-LeRobotの既定値は、Dora通常起動の`J7_TUNING_PROFILE=validated`を含む上記の値です。
+LeRobotのleader/follower既定値は、Dora通常起動の`J7_TUNING_PROFILE=validated`を
+含む上記の値です。
 重力項はwrapperがnative `openarm_teleop.sif`内のOpenArm Description 1.0.4から毎回生成する
 v10 bimanual URDFを用いて計算します。摩擦項は同じ式とrad/s単位を使用します。したがって、
-policy推論とCSV再生のどちらもnative followerと同じ数値・モデルの補償をMITトルク指令へ
-加算します。
+bilateral収集の両role、policy推論、CSV再生でnativeの対応roleと同じ数値・モデルの補償を
+MITトルク指令へ加算します。leaderとfollowerで異なるYAML値（例: J6の`Fc`）は混同しません。
 
 ## 関節角度制限
 
@@ -153,12 +172,15 @@ policy action送信エラーは引き続き両followerをdisableします。
 ## 設定・実装の参照先
 
 - Dora launcherとJ7 profile: `dora-openarm-data-collection/apptainer/run_openarm_teleop_udp_record.sh`
+- native leaderのPD・摩擦パラメータ: `openarm_teleop/config/leader.yaml`
 - native followerのPD・摩擦パラメータ: `openarm_teleop/config/follower.yaml`
 - native補償・ゼロ姿勢移動・tracking error: `openarm_teleop/src/controller/control.cpp`
 - native CSV用関節角度・速度制限: `openarm_teleop/src/openarm_constants.hpp`
 - native CSV検証: `openarm_teleop/src/startup_trajectory.cpp`
-- LeRobotのPD・左右別関節制限: [`../src/lerobot/robots/openarm_follower/config_openarm_follower.py`](../src/lerobot/robots/openarm_follower/config_openarm_follower.py)
-- LeRobotの重力・摩擦補償: [`../src/lerobot/robots/openarm_follower/openarm_dynamics.py`](../src/lerobot/robots/openarm_follower/openarm_dynamics.py)
+- LeRobot followerのPD・左右別関節制限: [`../src/lerobot/robots/openarm_follower/config_openarm_follower.py`](../src/lerobot/robots/openarm_follower/config_openarm_follower.py)
+- LeRobot leaderのPD・補償設定: [`../src/lerobot/teleoperators/openarm_leader/config_openarm_leader.py`](../src/lerobot/teleoperators/openarm_leader/config_openarm_leader.py)
+- LeRobotの共通重力・摩擦式: [`../src/lerobot/robots/openarm_follower/openarm_dynamics.py`](../src/lerobot/robots/openarm_follower/openarm_dynamics.py)
+- LeRobot leader feedback送信: [`../src/lerobot/teleoperators/openarm_leader/openarm_leader.py`](../src/lerobot/teleoperators/openarm_leader/openarm_leader.py)
 - LeRobot action送信: [`../src/lerobot/robots/openarm_follower/openarm_follower.py`](../src/lerobot/robots/openarm_follower/openarm_follower.py)
 - LeRobot CSV検証: [`../src/lerobot/robots/bi_openarm_follower/deployment_trajectory.py`](../src/lerobot/robots/bi_openarm_follower/deployment_trajectory.py)
 - LeRobot CSV再生: [`../src/lerobot/robots/bi_openarm_follower/bi_openarm_follower.py`](../src/lerobot/robots/bi_openarm_follower/bi_openarm_follower.py)
