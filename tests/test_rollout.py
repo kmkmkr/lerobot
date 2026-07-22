@@ -474,6 +474,73 @@ def test_dagger_generic_actuated_teleop_keeps_existing_handover_behavior():
 # ---------------------------------------------------------------------------
 
 
+def test_dagger_intervention_connects_teleop_before_coordinated_startup():
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.context import _connect_rollout_hardware
+
+    events: list[str] = []
+    robot = MagicMock()
+    robot.name = "bi_openarm_follower"
+    robot.connect.side_effect = lambda: events.append("robot.connect")
+    robot.prepare_for_intervention_deployment.side_effect = lambda teleop: events.append(
+        "robot.prepare_intervention"
+    )
+    robot.get_observation.side_effect = lambda: events.append("robot.get_observation") or {
+        "joint_1.pos": 1.0
+    }
+    teleop = MagicMock()
+    teleop.connect.side_effect = lambda: events.append("teleop.connect")
+    cfg = MagicMock()
+    cfg.strategy = DAggerStrategyConfig()
+    cfg.robot.type = "bi_openarm_follower"
+    cfg.teleop.type = "bi_openarm_leader"
+
+    with (
+        patch("lerobot.rollout.context.make_robot_from_config", return_value=robot),
+        patch("lerobot.rollout.context.make_teleoperator_from_config", return_value=teleop),
+    ):
+        raw_robot, wrapper, connected_teleop, initial_position = _connect_rollout_hardware(cfg)
+
+    assert events == [
+        "robot.connect",
+        "teleop.connect",
+        "robot.prepare_intervention",
+        "robot.get_observation",
+    ]
+    assert raw_robot is robot
+    assert wrapper.inner is robot
+    assert connected_teleop is teleop
+    assert initial_position == {"joint_1.pos": 1.0}
+    robot.prepare_for_intervention_deployment.assert_called_once_with(teleop)
+    robot.prepare_for_policy_deployment.assert_not_called()
+
+
+def test_dagger_intervention_startup_error_disconnects_both_roles():
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.context import _connect_rollout_hardware
+
+    robot = MagicMock()
+    robot.name = "bi_openarm_follower"
+    robot.is_connected = True
+    robot.prepare_for_intervention_deployment.side_effect = RuntimeError("tracking error")
+    teleop = MagicMock()
+    teleop.is_connected = True
+    cfg = MagicMock()
+    cfg.strategy = DAggerStrategyConfig()
+    cfg.robot.type = "bi_openarm_follower"
+    cfg.teleop.type = "bi_openarm_leader"
+
+    with (
+        patch("lerobot.rollout.context.make_robot_from_config", return_value=robot),
+        patch("lerobot.rollout.context.make_teleoperator_from_config", return_value=teleop),
+        pytest.raises(RuntimeError, match="tracking error"),
+    ):
+        _connect_rollout_hardware(cfg)
+
+    teleop.disconnect.assert_called_once_with()
+    robot.disconnect.assert_called_once_with()
+
+
 def test_rollout_context_fields():
     from lerobot.rollout import RolloutContext
 
@@ -512,6 +579,38 @@ def test_teardown_prefers_robot_specific_policy_deployment_return():
     robot.finish_policy_deployment.assert_called_once_with()
     wrapper.get_observation.assert_not_called()
     robot.disconnect.assert_called_once_with()
+
+
+def test_dagger_teardown_uses_coordinated_intervention_return():
+    from lerobot.rollout import DAggerStrategyConfig, HardwareContext
+    from lerobot.rollout.strategies.core import RolloutStrategy
+
+    class TestStrategy(RolloutStrategy):
+        def setup(self, ctx):
+            pass
+
+        def run(self, ctx):
+            pass
+
+        def teardown(self, ctx):
+            pass
+
+    robot = MagicMock()
+    robot.is_connected = True
+    robot.finish_intervention_deployment.return_value = True
+    wrapper = MagicMock()
+    wrapper.inner = robot
+    teleop = MagicMock()
+    teleop.is_connected = True
+    hardware = HardwareContext(robot_wrapper=wrapper, teleop=teleop, initial_position={})
+
+    strategy = TestStrategy(DAggerStrategyConfig())
+    strategy._teardown_hardware(hardware)
+
+    robot.finish_intervention_deployment.assert_called_once_with(teleop)
+    robot.finish_policy_deployment.assert_not_called()
+    robot.disconnect.assert_called_once_with()
+    teleop.disconnect.assert_called_once_with()
 
 
 def test_teardown_disconnects_when_robot_specific_return_fails():

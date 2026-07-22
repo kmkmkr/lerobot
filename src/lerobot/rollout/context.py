@@ -159,6 +159,69 @@ class RolloutContext:
 # ---------------------------------------------------------------------------
 
 
+def _disconnect_after_hardware_setup_error(robot, teleop: Teleoperator | None) -> None:
+    """Best-effort cleanup for failures before a RolloutContext exists."""
+    for label, device in (("teleoperator", teleop), ("robot", robot)):
+        if device is None:
+            continue
+        try:
+            if device.is_connected:
+                logger.info("Disconnecting %s after rollout hardware setup error", label)
+                device.disconnect()
+        except Exception:
+            logger.exception("Failed to disconnect %s after rollout hardware setup error", label)
+
+
+def _connect_rollout_hardware(cfg: RolloutConfig):
+    """Connect hardware and run the appropriate deployment startup lifecycle.
+
+    Intervention-aware robots expose ``prepare_for_intervention_deployment``.
+    For DAgger they need the teleoperator connected before startup motion so
+    leader and follower trajectories can be replayed together. All other
+    strategies retain the existing robot-first startup order.
+    """
+    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
+    robot = make_robot_from_config(cfg.robot)
+    teleop = None
+    try:
+        robot.connect()
+        logger.info("Robot connected: %s", robot.name)
+
+        intervention_prepare = getattr(robot, "prepare_for_intervention_deployment", None)
+        coordinated_intervention = isinstance(cfg.strategy, DAggerStrategyConfig) and callable(
+            intervention_prepare
+        )
+
+        if coordinated_intervention:
+            logger.info("Connecting teleoperator before coordinated intervention startup motion...")
+            teleop = make_teleoperator_from_config(cfg.teleop)
+            teleop.connect()
+            logger.info("Teleoperator connected")
+            intervention_prepare(teleop)
+        else:
+            prepare_for_policy_deployment = getattr(robot, "prepare_for_policy_deployment", None)
+            if callable(prepare_for_policy_deployment):
+                prepare_for_policy_deployment()
+
+            if cfg.teleop is not None:
+                logger.info("Connecting teleoperator (%s)...", cfg.teleop.type)
+                teleop = make_teleoperator_from_config(cfg.teleop)
+                teleop.connect()
+                logger.info("Teleoperator connected")
+
+        # Captured after any startup motion, so this is the task-ready reset
+        # pose for both ordinary and coordinated OpenArm deployment profiles.
+        initial_obs = robot.get_observation()
+        initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
+        logger.info("Captured initial robot position (%d keys)", len(initial_position))
+    except Exception:
+        logger.exception("Rollout hardware setup or startup motion failed")
+        _disconnect_after_hardware_setup_error(robot, teleop)
+        raise
+
+    return robot, ThreadSafeRobot(robot), teleop, initial_position
+
+
 def build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
@@ -233,50 +296,7 @@ def build_rollout_context(
         robot_observation_processor = robot_observation_processor or _o
 
     # --- 3. Hardware (heaviest side-effect, deferred) -----------------
-    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
-    robot = make_robot_from_config(cfg.robot)
-    robot.connect()
-    logger.info("Robot connected: %s", robot.name)
-
-    prepare_for_policy_deployment = getattr(robot, "prepare_for_policy_deployment", None)
-    if callable(prepare_for_policy_deployment):
-        try:
-            prepare_for_policy_deployment()
-        except Exception:
-            logger.exception("Robot policy-deployment startup motion failed; disconnecting hardware")
-            robot.disconnect()
-            raise
-
-    # This is captured after any robot-specific startup motion. It is therefore
-    # also the task-ready reset pose for OpenArm CSV deployment profiles.
-    initial_obs = robot.get_observation()
-    initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
-    logger.info("Captured initial robot position (%d keys)", len(initial_position))
-
-    robot_wrapper = ThreadSafeRobot(robot)
-
-    teleop = None
-    if cfg.teleop is not None:
-        logger.info("Connecting teleoperator (%s)...", cfg.teleop.type if cfg.teleop else "?")
-        teleop = make_teleoperator_from_config(cfg.teleop)
-        teleop.connect()
-        logger.info("Teleoperator connected")
-
-    # TODO(Steven): once Teleoperator motor-control methods are standardised
-    # (``enable_torque`` / ``disable_torque`` / ``write_goal_positions``), gate
-    # the DAgger strategy on their presence here and fail fast with a helpful
-    # message instead of relying on the operator to pre-align the leader by
-    # hand.  See :func:`DAggerStrategy._apply_transition` for the matching
-    # disabled call sites.
-    # if isinstance(cfg.strategy, DAggerStrategyConfig) and teleop is not None:
-    #     required_teleop_methods = ("enable_torque", "disable_torque", "write_goal_positions")
-    #     missing = [m for m in required_teleop_methods if not callable(getattr(teleop, m, None))]
-    #     if missing:
-    #         teleop.disconnect()
-    #         raise ValueError(
-    #             f"DAgger strategy requires a teleoperator with motor control methods "
-    #             f"{required_teleop_methods}. '{type(teleop).__name__}' is missing: {missing}"
-    #         )
+    robot, robot_wrapper, teleop, initial_position = _connect_rollout_hardware(cfg)
 
     # --- 4. Features + action-key reconciliation ---------------------
     # TODO(Steven):Only ``.pos`` joint features are routed to the policy as state and as the

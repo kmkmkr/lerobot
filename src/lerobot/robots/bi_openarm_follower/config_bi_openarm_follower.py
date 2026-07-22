@@ -39,8 +39,10 @@ class BiOpenArmFollowerConfig(RobotConfig):
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
     # Optional task-ready CSV profile used only by lerobot-rollout's policy
-    # deployment lifecycle.  The profile directory must contain left_arm.csv
-    # and right_arm.csv in openarm_v1_motor_zero radians.
+    # deployment lifecycle. Base rollout moves both followers; OpenArm DAgger
+    # replays the same targets on both leaders and followers. The profile
+    # directory must contain left_arm.csv and right_arm.csv in
+    # openarm_v1_motor_zero radians.
     deployment_trajectory_profile: str | None = None
     deployment_control_frequency_hz: float = 50.0
     startup_zero_pose_duration_s: float = 2.2

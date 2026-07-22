@@ -188,6 +188,35 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
             self.disable_torque()
             raise
 
+    def hold_position_after_shutdown_error(self) -> None:
+        """Keep both leaders energized at their measured pose after a failed return.
+
+        The coordinated OpenArm shutdown path uses the same fail-safe as the
+        followers: refresh a current-position command, then close CAN without
+        disabling torque so none of the four arms free-falls unexpectedly.
+        """
+        for side, source_config, arm in (
+            ("left", self.config.left_arm_config, self.left_arm),
+            ("right", self.config.right_arm_config, self.right_arm),
+        ):
+            source_config.disable_torque_on_disconnect = False
+            arm.config.disable_torque_on_disconnect = False
+            if not arm.bus.is_connected:
+                logger.error("Cannot refresh the %s OpenArm leader hold because its CAN bus is closed", side)
+                continue
+            try:
+                action = arm.get_action()
+                feedback = {key: float(value) for key, value in action.items() if key.endswith(".pos")}
+                arm.send_feedback(feedback)
+            except Exception:
+                logger.exception("Failed to refresh the %s OpenArm leader hold command", side)
+
+        logger.critical(
+            "OpenArm coordinated shutdown return failed. Both leaders will remain torque-enabled "
+            "at their measured pose when CAN is disconnected. Support all arms before removing "
+            "power or manually disabling torque."
+        )
+
     @check_if_not_connected
     def disable_torque(self) -> None:
         for side, arm in (("left", self.left_arm), ("right", self.right_arm)):

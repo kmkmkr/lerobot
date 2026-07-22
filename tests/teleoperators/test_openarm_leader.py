@@ -266,3 +266,33 @@ def test_bimanual_rejects_mixed_free_motion_and_bilateral_modes(tmp_path):
 
     with pytest.raises(ValueError, match="same manual_control mode"):
         BiOpenArmLeader(config)
+
+
+def test_bimanual_shutdown_error_hold_survives_disconnect_cleanup(tmp_path):
+    left_arm = MagicMock(name="left_arm")
+    right_arm = MagicMock(name="right_arm")
+    for arm in (left_arm, right_arm):
+        arm.bus.is_connected = True
+        arm.config.disable_torque_on_disconnect = True
+        arm.get_action.return_value = {
+            "joint_1.pos": 1.0,
+            "joint_1.vel": 2.0,
+            "joint_1.torque": 3.0,
+        }
+    config = BiOpenArmLeaderConfig(
+        id="leader",
+        calibration_dir=tmp_path,
+        left_arm_config=OpenArmLeaderConfigBase(port="can1", gravity_compensation=False),
+        right_arm_config=OpenArmLeaderConfigBase(port="can0", gravity_compensation=False),
+    )
+    with patch(f"{_BI_MODULE}.OpenArmLeader", side_effect=(left_arm, right_arm)):
+        leader = BiOpenArmLeader(config)
+
+    leader.hold_position_after_shutdown_error()
+
+    assert not config.left_arm_config.disable_torque_on_disconnect
+    assert not config.right_arm_config.disable_torque_on_disconnect
+    assert not left_arm.config.disable_torque_on_disconnect
+    assert not right_arm.config.disable_torque_on_disconnect
+    left_arm.send_feedback.assert_called_once_with({"joint_1.pos": 1.0})
+    right_arm.send_feedback.assert_called_once_with({"joint_1.pos": 1.0})

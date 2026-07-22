@@ -20,9 +20,9 @@ LeRobotの公開actionと関節制限はmotor-zero基準のdegreeで扱われま
 | Dora bilateral teleop | nativeのrole別PD | あり | あり | 通常テレオペ中は後述のCSV用関節制限でclipしない。送信前にDamiao motor固有のMIT制御範囲を検査し、違反時はモータをdisableする |
 | Dora 姿勢移動CSV再生 | 原則としてbilateral teleopと同じPD | 原則としてあり | 原則としてあり | 再生開始前にnative側の関節角度・速度制限でCSVを検証する。再生中のtracking error上限は`0.35 rad` |
 | LeRobot bilateral teleop・収集 | nativeのrole別PD | あり | あり | follower actionは左右別安全範囲へclipする。leader feedbackはOpenArm Descriptionの左右別物理範囲を外れると拒否し、bimanual feedbackエラーでは両leaderをdisableする |
-| LeRobot DAgger | nativeのrole別PD | あり | あり | autonomous・paused・correctingの全phaseで実測follower姿勢をleaderへ返す。OpenArm leaderのトルクをphase遷移でdisableせず、policy推論中と人介入中の両方でbilateral制御を維持する |
+| LeRobot DAgger | nativeのrole別PD | あり | あり | 起動時はleader/followerが各自の実測姿勢からzeroへ移動し、同じCSV目標をtask-readyまで再生する。その後はautonomous・paused・correctingの全phaseで実測follower姿勢をleaderへ返す。終了時は4台で同じ逆CSVをzeroまで再生する |
 | LeRobot policyデプロイ | bilateral followerと同じPD | あり | あり | 左右別の安全制限内へ各actionをclipする。`max_relative_target`は既定で無効 |
-| LeRobot 姿勢移動CSV再生 | bilateral followerと同じPD | あり | あり | CSVを左右別の制限で事前検証し、送信時にも同じ範囲へclipする。clipまたはtracking errorを検出すると再生を中止する。起動時エラーは両followerをdisableし、終了復帰時エラーは既定で現在姿勢を保持してCAN切断時もトルクを維持する |
+| LeRobot 姿勢移動CSV再生 | nativeのrole別PD | あり | あり | 通常rolloutは両follower、DAgger介入は左右leader/followerの4台で再生する。CSVを左右別の制限で事前検証し、送信時にも同じ範囲へclipする。clipまたはtracking errorを検出すると再生を中止する |
 
 LeRobotではleader feedback、policy推論、CSV再生のPDゲインを独立して設定できます。
 既定値はそれぞれnative bilateralの同じroleを正として揃えています。位置のみの標準構成では
@@ -75,6 +75,11 @@ followerは通常のbilateral PDではなく、次の低いゲインを使用し
 この区間のトルクフィードフォワードは`0`なので、重力補償と摩擦補償は適用されません。
 ホーム姿勢に到達した後のCSV順再生と、終了時のタスク姿勢へのblend・CSV逆再生には
 通常のDora follower用PD、重力補償、摩擦補償が適用されます。
+
+LeRobotはこのnative起動区間の低ゲイン例外を模倣せず、全区間でrole別の通常ゲインと
+補償を使用します。DAgger介入時はleaderとfollowerが各自の実測開始姿勢からzeroへ
+blendし、zero以降は同じ左右別CSV目標を共有します。task-ready到達後は実測follower
+姿勢をleader目標へ引き継ぎ、policy推論中の連続bilateral feedbackへ移行します。
 
 ## 重力補償と摩擦補償
 
@@ -167,12 +172,14 @@ v1.0.4の機械的範囲まで拡大しています。blend開始時に読み取
 既定`1 deg`以内だけ越えている場合は境界値へ丸めます。それ以上の逸脱は動作を開始せず
 エラーにします。
 
-終了復帰中のエラーでは、自由落下を避けるため、既定で測定中の現在姿勢をtrajectory用
-PDで再指令し、後続のCAN切断でもトルクをdisableしません。プロセス終了後もアームは
-通電・保持状態となるため、電源断または手動disableの前に必ず両アームを支えてください。
+終了復帰中のエラーでは、自由落下を避けるため、既定で測定中の現在姿勢を再指令し、
+後続のCAN切断でもトルクをdisableしません。通常rolloutでは両follower、DAgger介入では
+role別PD・補償を用いる左右leader/followerの4台が対象です。プロセス終了後もアームは
+通電・保持状態となるため、電源断または手動disableの前に対象アームをすべて支えてください。
 従来どおりエラー時にdisableする必要がある場合は
 `robot.hold_position_on_shutdown_error=false`を指定します。起動時の姿勢移動エラーと
-policy action送信エラーは引き続き両followerをdisableします。
+policy action送信エラーは通常rolloutでは両followerをdisableします。DAggerの同期起動
+エラーではleader/followerの4台をdisableします。
 
 ## 設定・実装の参照先
 

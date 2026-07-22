@@ -164,8 +164,9 @@ calibration JSON files.
 ## Deploy A Policy From The Task-Ready Pose
 
 `lerobot-rollout` can reuse the exact CSV profile exported for bilateral
-teleoperation. When `robot.deployment_trajectory_profile` is set, the policy
-deployment lifecycle is:
+teleoperation. For a non-intervention strategy, when
+`robot.deployment_trajectory_profile` is set, the policy deployment lifecycle
+is:
 
 1. Connect both followers and move them smoothly to exact motor zero.
 2. Replay `left_arm.csv` and `right_arm.csv` together to the task-ready pose.
@@ -180,6 +181,9 @@ deployment lifecycle is:
    torque-enabled at their current pose by default. The subsequent cleanup
    closes CAN and cameras without disabling torque, preventing the arms from
    free-falling.
+
+OpenArm DAgger extends this lifecycle to both leaders as described below. The
+standalone home-motion test remains follower-only.
 
 ### Test Only The Home-Motion Round Trip
 
@@ -352,11 +356,28 @@ active both while the policy drives the follower and while the person moves the
 leader to correct it. The follower continues to use its native-aligned PD and
 compensation for policy and correction actions.
 
+For `bi_openarm_follower`, OpenArm DAgger requires
+`robot.deployment_trajectory_profile`. It connects both followers and both
+leaders before startup motion. Each role blends from its own measured pose to
+exact motor zero, then all four devices receive the same side-specific CSV
+targets through the task-ready pose. Followers use their trajectory PD and
+compensation; leaders use the native-aligned leader PD and compensation. At the
+handover to inference, the measured follower pose becomes the leader reference,
+so continuous bilateral feedback starts without a reference jump.
+
+With the default `return_to_initial_position=true`, shutdown blends all four
+devices back to the task-ready pose and replays the same reversed CSV to exact
+motor zero before disconnecting. A startup replay error disables all four
+devices. A shutdown-return error keeps all four holding their measured poses by
+default, including across CAN disconnect. The warning confirmation evaluates
+both leader and follower joints.
+
 Do not set `teleop.{left,right}_arm_config.manual_control=true` for this DAgger
 mode: that is a torque-disabled diagnostic and deliberately opts out of
-continuous bilateral feedback. Support all four arms, align each leader with
-its follower before connection, test at conservative follower relative-action
-limits, and perform a fresh physical validation before collecting task data.
+continuous bilateral feedback and coordinated replay. Support all four arms,
+verify that each device has a collision-free path from its current pose through
+motor zero, test at conservative follower relative-action limits, and perform a
+fresh physical validation before collecting task data.
 
 LeRobot also applies the native role-specific gravity and friction feed-forward
 terms: to leaders during bilateral teleoperation/recording, and to followers
@@ -397,8 +418,9 @@ Relevant motion settings and defaults are:
 
 The zero transition is part of the reverse trajectory and is therefore also
 scaled by `shutdown_replay_speed`. Set `--return_to_initial_position=false` to
-skip the complete shutdown return and disable the followers in their final
-pose. Set `--robot.hold_position_on_shutdown_error=false` only when the former
+skip the complete shutdown return and disable connected arms in their final
+pose; in OpenArm DAgger this means both leaders and both followers. Set
+`--robot.hold_position_on_shutdown_error=false` only when the former
 abort-and-disable behavior is preferable to holding after a shutdown-return
 error.
 

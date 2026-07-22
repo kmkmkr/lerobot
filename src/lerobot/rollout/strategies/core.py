@@ -122,14 +122,27 @@ class RolloutStrategy(abc.ABC):
             logger.info("Stopping inference engine...")
             self._engine.stop()
         robot = hw.robot_wrapper.inner
+        teleop = hw.teleop
         try:
             if robot.is_connected:
                 try:
                     if return_to_initial_position:
-                        finish_policy_deployment = getattr(robot, "finish_policy_deployment", None)
-                        specialized_return = (
-                            bool(finish_policy_deployment()) if callable(finish_policy_deployment) else False
+                        finish_intervention_deployment = getattr(
+                            robot, "finish_intervention_deployment", None
                         )
+                        if (
+                            self.config.type == "dagger"
+                            and teleop is not None
+                            and callable(finish_intervention_deployment)
+                        ):
+                            specialized_return = bool(finish_intervention_deployment(teleop))
+                        else:
+                            finish_policy_deployment = getattr(robot, "finish_policy_deployment", None)
+                            specialized_return = (
+                                bool(finish_policy_deployment())
+                                if callable(finish_policy_deployment)
+                                else False
+                            )
                         if not specialized_return and hw.initial_position:
                             logger.info("Returning robot to initial position before shutdown...")
                             self._return_to_initial_position(hw)
@@ -141,7 +154,6 @@ class RolloutStrategy(abc.ABC):
                     logger.info("Disconnecting robot...")
                     robot.disconnect()
         finally:
-            teleop = hw.teleop
             if teleop is not None and teleop.is_connected:
                 logger.info("Disconnecting teleoperator...")
                 teleop.disconnect()

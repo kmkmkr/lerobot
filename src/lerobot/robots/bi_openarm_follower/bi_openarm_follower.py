@@ -19,13 +19,14 @@ import math
 import time
 from functools import cached_property
 from pathlib import Path
+from typing import Any
 
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.bimanual import BimanualMixin
 from lerobot.utils.decorators import check_if_not_connected
 from lerobot.utils.robot_utils import precise_sleep
 
-from ..openarm_follower import OpenArmFollower, OpenArmFollowerConfig
+from ..openarm_follower import OPENARM_V1_PHYSICAL_JOINT_LIMITS, OpenArmFollower, OpenArmFollowerConfig
 from ..robot import Robot
 from .config_bi_openarm_follower import BiOpenArmFollowerConfig
 from .confirmation import confirm_openarm_motion
@@ -229,11 +230,102 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             "right": tuple(right_positions[motor] for motor in MOTOR_NAMES),
         }
 
+    def _validate_intervention_teleop(self, teleop: Any) -> None:
+        """Validate the bimanual leader contract before coordinated motion."""
+        if getattr(teleop, "name", None) != "bi_openarm_leader":
+            raise ValueError(
+                "OpenArm DAgger deployment trajectories require --teleop.type=bi_openarm_leader"
+            )
+        if not bool(getattr(teleop, "requires_continuous_feedback", False)):
+            raise ValueError(
+                "OpenArm DAgger deployment trajectories require bilateral leader control; "
+                "manual_control must be false on both leaders"
+            )
+        required_methods = (
+            "get_action",
+            "send_feedback",
+            "disable_torque",
+            "hold_position_after_shutdown_error",
+        )
+        missing_methods = [name for name in required_methods if not callable(getattr(teleop, name, None))]
+        if missing_methods:
+            raise ValueError(
+                "OpenArm DAgger teleoperator is missing coordinated deployment methods: "
+                f"{missing_methods}"
+            )
+        expected_features = {
+            f"{side}_{motor_name}.pos" for side in ("left", "right") for motor_name in MOTOR_NAMES
+        }
+        missing_features = sorted(expected_features - set(teleop.feedback_features))
+        if missing_features:
+            raise ValueError(
+                "OpenArm DAgger teleoperator is missing deployment feedback features: "
+                f"{missing_features}"
+            )
+
+    def _read_intervention_positions(self, teleop: Any) -> dict[str, tuple[float, ...]]:
+        action = teleop.get_action()
+        measured: dict[str, tuple[float, ...]] = {}
+        for side in ("left", "right"):
+            side_positions: list[float] = []
+            physical_limits = OPENARM_V1_PHYSICAL_JOINT_LIMITS[side]
+            for motor_name in MOTOR_NAMES:
+                key = f"{side}_{motor_name}.pos"
+                if key not in action:
+                    raise RuntimeError(f"OpenArm leader deployment state is missing {key}")
+                position = float(action[key])
+                if not math.isfinite(position):
+                    raise RuntimeError(
+                        f"OpenArm leader deployment state is not finite: side={side} "
+                        f"motor={motor_name} actual={position}"
+                    )
+                minimum, maximum = physical_limits[motor_name]
+                if not minimum <= position <= maximum:
+                    raise RuntimeError(
+                        f"OpenArm leader deployment state exceeds the physical limit: side={side} "
+                        f"motor={motor_name} actual={position:.3f} "
+                        f"limit=[{minimum:.3f}, {maximum:.3f}] deg"
+                    )
+                side_positions.append(position)
+            measured[side] = tuple(side_positions)
+        return measured
+
     @staticmethod
     def _as_action(positions: tuple[float, ...]) -> RobotAction:
         return {
             f"{motor_name}.pos": position for motor_name, position in zip(MOTOR_NAMES, positions, strict=True)
         }
+
+    @classmethod
+    def _as_bimanual_action(cls, targets: dict[str, tuple[float, ...]]) -> RobotAction:
+        return {
+            f"{side}_{key}": value
+            for side in ("left", "right")
+            for key, value in cls._as_action(targets[side]).items()
+        }
+
+    def _check_deployment_tracking(
+        self,
+        measured: dict[str, tuple[float, ...]],
+        targets: dict[str, tuple[float, ...]],
+        *,
+        role: str,
+        phase: str,
+        reference_time_s: float,
+    ) -> None:
+        error_limit = self.config.deployment_tracking_error_deg
+        for side in ("left", "right"):
+            for motor_name, target, actual in zip(
+                MOTOR_NAMES, targets[side], measured[side], strict=True
+            ):
+                tracking_error = abs(actual - target)
+                if tracking_error > error_limit:
+                    raise RuntimeError(
+                        f"OpenArm deployment trajectory tracking error: role={role} side={side} "
+                        f"phase={phase} time={reference_time_s:.3f}s motor={motor_name} "
+                        f"target={target:.3f} actual={actual:.3f} error={tracking_error:.3f} "
+                        f"limit={error_limit:.3f} deg"
+                    )
 
     def _send_deployment_targets(
         self,
@@ -261,17 +353,36 @@ class BiOpenArmFollower(BimanualMixin, Robot):
                         f"motor={motor_name} requested={requested:.3f} sent={sent:.3f} deg"
                     )
 
-        measured = self._read_deployment_positions()
-        error_limit = self.config.deployment_tracking_error_deg
-        for side in ("left", "right"):
-            for motor_name, target, actual in zip(MOTOR_NAMES, targets[side], measured[side], strict=True):
-                tracking_error = abs(actual - target)
-                if tracking_error > error_limit:
-                    raise RuntimeError(
-                        f"OpenArm deployment trajectory tracking error: side={side} phase={phase} "
-                        f"time={reference_time_s:.3f}s motor={motor_name} target={target:.3f} "
-                        f"actual={actual:.3f} error={tracking_error:.3f} limit={error_limit:.3f} deg"
-                    )
+        self._check_deployment_tracking(
+            self._read_deployment_positions(),
+            targets,
+            role="follower",
+            phase=phase,
+            reference_time_s=reference_time_s,
+        )
+
+    def _send_coordinated_deployment_targets(
+        self,
+        teleop: Any,
+        follower_targets: dict[str, tuple[float, ...]],
+        leader_targets: dict[str, tuple[float, ...]],
+        *,
+        phase: str,
+        reference_time_s: float,
+    ) -> None:
+        self._send_deployment_targets(
+            follower_targets,
+            phase=phase,
+            reference_time_s=reference_time_s,
+        )
+        teleop.send_feedback(self._as_bimanual_action(leader_targets))
+        self._check_deployment_tracking(
+            self._read_intervention_positions(teleop),
+            leader_targets,
+            role="leader",
+            phase=phase,
+            reference_time_s=reference_time_s,
+        )
 
     def _clamp_measured_blend_start(
         self,
@@ -345,6 +456,58 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             }
             self._send_deployment_targets(positions, phase=phase, reference_time_s=elapsed_s)
 
+    def _blend_intervention_positions(
+        self,
+        teleop: Any,
+        follower_start: dict[str, tuple[float, ...]],
+        leader_start: dict[str, tuple[float, ...]],
+        target: dict[str, tuple[float, ...]],
+        duration_s: float,
+        phase: str,
+    ) -> None:
+        """Blend both roles from their own measured pose to one shared target."""
+        if duration_s <= 0.0:
+            self._send_coordinated_deployment_targets(
+                teleop,
+                target,
+                target,
+                phase=phase,
+                reference_time_s=0.0,
+            )
+            return
+        follower_start = self._clamp_measured_blend_start(follower_start, phase)
+        steps = max(math.ceil(duration_s * self.config.deployment_control_frequency_hz), 1)
+        start_time = time.perf_counter()
+        for step in range(1, steps + 1):
+            elapsed_s = duration_s * step / steps
+            sleep_s = start_time + elapsed_s - time.perf_counter()
+            if sleep_s > 0.0:
+                precise_sleep(sleep_s)
+            alpha = step / steps
+            smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            follower_targets = {
+                side: tuple(
+                    before + (after - before) * smooth_alpha
+                    for before, after in zip(follower_start[side], target[side], strict=True)
+                )
+                for side in ("left", "right")
+            }
+            leader_targets = {
+                side: tuple(
+                    before + (after - before) * smooth_alpha
+                    for before, after in zip(leader_start[side], target[side], strict=True)
+                )
+                for side in ("left", "right")
+            }
+
+            self._send_coordinated_deployment_targets(
+                teleop,
+                follower_targets,
+                leader_targets,
+                phase=phase,
+                reference_time_s=elapsed_s,
+            )
+
     def _replay_deployment_trajectories(
         self,
         trajectories: dict[str, list[DeploymentTrajectorySample]],
@@ -367,6 +530,125 @@ class BiOpenArmFollower(BimanualMixin, Robot):
                 for side, samples in trajectories.items()
             }
             self._send_deployment_targets(targets, phase=phase, reference_time_s=elapsed_s)
+
+    def _replay_intervention_trajectories(
+        self,
+        teleop: Any,
+        trajectories: dict[str, list[DeploymentTrajectorySample]],
+        speed_scale: float,
+        phase: str,
+    ) -> None:
+        """Replay one time-indexed target stream on both leaders and followers."""
+        recorded_duration_s = max(samples[-1].time_s for samples in trajectories.values())
+        playback_duration_s = recorded_duration_s / speed_scale
+        steps = max(math.ceil(playback_duration_s * self.config.deployment_control_frequency_hz), 1)
+        start_time = time.perf_counter()
+        for step in range(steps + 1):
+            elapsed_s = playback_duration_s * step / steps
+            if step > 0:
+                sleep_s = start_time + elapsed_s - time.perf_counter()
+                if sleep_s > 0.0:
+                    precise_sleep(sleep_s)
+            recorded_time_s = elapsed_s * speed_scale
+            targets = {
+                side: interpolate_deployment_trajectory(samples, recorded_time_s)
+                for side, samples in trajectories.items()
+            }
+            self._send_coordinated_deployment_targets(
+                teleop,
+                targets,
+                targets,
+                phase=phase,
+                reference_time_s=elapsed_s,
+            )
+
+    def _disable_intervention_hardware(self, teleop: Any) -> None:
+        self._disable_both_arms()
+        try:
+            teleop.disable_torque()
+        except Exception:
+            logger.exception("Failed to disable both OpenArm leaders after deployment motion error")
+
+    def _hold_intervention_hardware_after_shutdown_error(self, teleop: Any) -> None:
+        self._hold_both_arms_after_shutdown_error()
+        try:
+            teleop.hold_position_after_shutdown_error()
+        except Exception:
+            logger.exception("Failed to preserve both OpenArm leaders after shutdown return error")
+
+    def prepare_for_intervention_deployment(self, teleop: Any) -> bool:
+        """Move all four OpenArm devices through zero and the task-ready CSV."""
+        if not self.has_policy_deployment_trajectory:
+            raise ValueError(
+                "OpenArm DAgger intervention requires --robot.deployment_trajectory_profile"
+            )
+        self._validate_intervention_teleop(teleop)
+
+        logger.info(
+            "Moving both OpenArm leaders and followers to exact motor zero before CSV replay..."
+        )
+        zero_targets = {"left": (0.0,) * len(MOTOR_NAMES), "right": (0.0,) * len(MOTOR_NAMES)}
+        try:
+            self._blend_intervention_positions(
+                teleop,
+                self._read_deployment_positions(),
+                self._read_intervention_positions(teleop),
+                zero_targets,
+                self.config.startup_zero_pose_duration_s,
+                "startup-zero",
+            )
+
+            first_targets = {
+                side: samples[0].positions_deg for side, samples in self._deployment_trajectories.items()
+            }
+            if self.config.startup_trajectory_blend_s > 0.0:
+                self._blend_intervention_positions(
+                    teleop,
+                    self._read_deployment_positions(),
+                    self._read_intervention_positions(teleop),
+                    first_targets,
+                    self.config.startup_trajectory_blend_s,
+                    "startup-blend",
+                )
+
+            logger.info(
+                "Replaying synchronized leader/follower task-ready CSV trajectory at %.2fx...",
+                self.config.startup_trajectory_speed,
+            )
+            self._replay_intervention_trajectories(
+                teleop,
+                self._deployment_trajectories,
+                self.config.startup_trajectory_speed,
+                "startup-replay",
+            )
+
+            # Switch the followers from trajectory gains to policy gains at the
+            # same pose, then switch the leaders from CSV references to measured
+            # follower feedback without a target discontinuity.
+            final_action = {
+                f"{side}_{motor_name}.pos": position
+                for side, samples in self._deployment_trajectories.items()
+                for motor_name, position in zip(MOTOR_NAMES, samples[-1].positions_deg, strict=True)
+            }
+            self.send_action(final_action)
+            follower_measured = self._read_deployment_positions()
+            teleop.send_feedback(self._as_bimanual_action(follower_measured))
+            self._check_deployment_tracking(
+                self._read_intervention_positions(teleop),
+                follower_measured,
+                role="leader",
+                phase="startup-handover",
+                reference_time_s=0.0,
+            )
+        except Exception:
+            self._disable_intervention_hardware(teleop)
+            raise
+
+        logger.info(
+            "OpenArm leaders and followers are task-ready; policy inference and bilateral feedback "
+            "gains are active."
+        )
+        return True
 
     def prepare_for_policy_deployment(self) -> bool:
         """Move both followers through motor zero and the task-ready CSV before inference."""
@@ -492,6 +774,81 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             raise
 
         logger.info("Both OpenArm followers reached exact motor zero.")
+        return True
+
+    def finish_intervention_deployment(self, teleop: Any) -> bool:
+        """Return all four OpenArm devices along the reversed CSV path to zero."""
+        if not self.has_policy_deployment_trajectory:
+            raise ValueError(
+                "OpenArm DAgger intervention requires --robot.deployment_trajectory_profile"
+            )
+        self._validate_intervention_teleop(teleop)
+
+        try:
+            follower_current = self._read_deployment_positions()
+            leader_current = self._read_intervention_positions(teleop)
+            task_targets = {
+                side: samples[-1].positions_deg for side, samples in self._deployment_trajectories.items()
+            }
+            warnings: list[str] = []
+            for role, measured in (("leader", leader_current), ("follower", follower_current)):
+                for side in ("left", "right"):
+                    for motor_name, actual, target in zip(
+                        MOTOR_NAMES, measured[side], task_targets[side], strict=True
+                    ):
+                        difference = abs(actual - target)
+                        if difference > self.config.shutdown_task_pose_warn_deg:
+                            warnings.append(
+                                f"role={role} side={side} motor={motor_name} actual={actual:.3f} "
+                                f"task_ready={target:.3f} difference={difference:.3f} deg"
+                            )
+
+            if warnings:
+                logger.warning(
+                    "One or more OpenArm leader/follower joints are farther than %.3f deg "
+                    "from the task-ready pose:",
+                    self.config.shutdown_task_pose_warn_deg,
+                )
+                for warning in warnings:
+                    logger.warning("  %s", warning)
+                if not self._confirm_shutdown_return():
+                    logger.info("Coordinated shutdown return declined; disabling all devices in place.")
+                    return True
+
+            logger.info(
+                "Blending both OpenArm leaders and followers to the task-ready pose over %.1fs...",
+                self.config.shutdown_task_pose_blend_s,
+            )
+            self._blend_intervention_positions(
+                teleop,
+                follower_current,
+                leader_current,
+                task_targets,
+                self.config.shutdown_task_pose_blend_s,
+                "shutdown-task-pose",
+            )
+            return_trajectories = {
+                side: build_return_to_zero_trajectory(samples, self.config.shutdown_zero_transition_s)
+                for side, samples in self._deployment_trajectories.items()
+            }
+            logger.info(
+                "Replaying synchronized reversed leader/follower CSV trajectory to motor zero at %.2fx...",
+                self.config.shutdown_replay_speed,
+            )
+            self._replay_intervention_trajectories(
+                teleop,
+                return_trajectories,
+                self.config.shutdown_replay_speed,
+                "shutdown-replay",
+            )
+        except Exception:
+            if self.config.hold_position_on_shutdown_error:
+                self._hold_intervention_hardware_after_shutdown_error(teleop)
+            else:
+                self._disable_intervention_hardware(teleop)
+            raise
+
+        logger.info("Both OpenArm leaders and followers reached exact motor zero.")
         return True
 
     @property
