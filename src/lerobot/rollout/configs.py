@@ -170,6 +170,11 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     to record both autonomous and correction frames with size-based episode
     rotation (same as Sentry) and background uploading.  ``push_to_hub`` is
     blocked while a correction is in progress.
+
+    A teleoperator that declares ``requires_continuous_feedback`` receives the
+    measured follower observation throughout autonomous, paused, and correction
+    phases.  Its torque remains enabled across phase transitions, which keeps
+    bilateral control active for OpenArm leaders during human intervention.
     """
 
     # Number of correction episodes to collect (corrections-only mode).

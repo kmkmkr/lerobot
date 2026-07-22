@@ -34,6 +34,12 @@ Recording modes:
         Each correction (start to stop) becomes one episode.
 
 Teleoperator handover:
+    Teleoperators that declare ``requires_continuous_feedback`` (the OpenArm
+    bilateral leaders) receive the measured follower observation on every
+    control tick in every phase.  Their torque remains enabled across DAgger
+    transitions so leader PD, gravity compensation, friction compensation,
+    and force reflection stay active during policy execution and intervention.
+
     On AUTONOMOUS → PAUSED, actuated teleops (those with non-empty
     ``feedback_features``, e.g. SO-101, OpenArmMini) are smoothly driven to
     the follower's last position via ``send_feedback`` so the operator takes
@@ -73,6 +79,17 @@ from ..context import RolloutContext
 from .core import RolloutStrategy, estimate_max_episode_seconds, safe_push_to_hub, send_next_action
 
 logger = logging.getLogger(__name__)
+
+
+def _teleop_requires_continuous_feedback(teleop) -> bool:
+    """Return whether a teleoperator needs follower feedback on every control tick."""
+    return bool(getattr(teleop, "requires_continuous_feedback", False))
+
+
+def _send_continuous_feedback(teleop, observation: dict[str, Any]) -> None:
+    """Maintain feedback control for teleoperators such as the OpenArm leader."""
+    if _teleop_requires_continuous_feedback(teleop):
+        teleop.send_feedback(observation)
 
 
 # ---------------------------------------------------------------------------
@@ -379,13 +396,19 @@ class DAggerStrategy(RolloutStrategy):
                     phase = events.phase
                     obs = robot.get_observation()
 
+                    # Read the leader before returning follower feedback so OpenArm
+                    # compensation can reuse the fresh leader state. Feedback is
+                    # then maintained once per tick in every DAgger phase.
+                    teleop_action = teleop.get_action() if phase == DAggerPhase.CORRECTING else None
+                    _send_continuous_feedback(teleop, obs)
+
                     # --- CORRECTING: human teleop control ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
                     # decouple the two, sample teleop at its native rate and
                     # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
                         obs_processed = ctx.processors.robot_observation_processor(obs)
-                        teleop_action = teleop.get_action()
+                        assert teleop_action is not None
                         processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
                         robot_action_to_send = ctx.processors.robot_action_processor((processed_teleop, obs))
                         robot.send_action(robot_action_to_send)
@@ -559,13 +582,19 @@ class DAggerStrategy(RolloutStrategy):
                     phase = events.phase
                     obs = robot.get_observation()
 
+                    # Read the leader before returning follower feedback so OpenArm
+                    # compensation can reuse the fresh leader state. Feedback is
+                    # then maintained once per tick in every DAgger phase.
+                    teleop_action = teleop.get_action() if phase == DAggerPhase.CORRECTING else None
+                    _send_continuous_feedback(teleop, obs)
+
                     # --- CORRECTING: human teleop control + recording ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
                     # decouple the two, sample teleop at its native rate and
                     # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
                         obs_processed = ctx.processors.robot_observation_processor(obs)
-                        teleop_action = teleop.get_action()
+                        assert teleop_action is not None
                         processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
                         robot_action_to_send = ctx.processors.robot_action_processor((processed_teleop, obs))
                         robot.send_action(robot_action_to_send)
@@ -637,6 +666,8 @@ class DAggerStrategy(RolloutStrategy):
         AUTONOMOUS -> PAUSED (actuated teleop):
             Pause the engine, then drive the leader arm to the follower's last
             commanded position so the operator takes over without a jerk.
+            Continuous-feedback teleops already track measured follower state,
+            so they do not need this blocking handover.
 
         PAUSED -> CORRECTING (non-actuated teleop):
             Slide the follower to the teleop's current pose so the robot meets
@@ -648,16 +679,21 @@ class DAggerStrategy(RolloutStrategy):
 
         PAUSED -> AUTONOMOUS:
             Reset and resume the inference engine.
+
+        Continuous-feedback teleops keep torque enabled for all transitions;
+        the main loop supplies measured follower feedback in every phase.
         """
         teleop = ctx.hardware.teleop
         robot = ctx.hardware.robot_wrapper
+        supports_feedback = teleop_supports_feedback(teleop)
+        continuous_feedback = _teleop_requires_continuous_feedback(teleop)
 
         logger.info("Phase transition: %s -> %s", old_phase.value, new_phase.value)
         if old_phase == DAggerPhase.AUTONOMOUS and new_phase == DAggerPhase.PAUSED:
             logger.info("Pausing engine - robot holds position")
             engine.pause()
 
-            if teleop_supports_feedback(teleop) and prev_action is not None:
+            if supports_feedback and not continuous_feedback and prev_action is not None:
                 # TODO(Maxime): prev_action is in robot action key space (output of robot_action_processor).
                 # send_feedback expects teleop feedback key space. For homogeneous setups (e.g. SO-101
                 # leader + SO-101 follower) the keys are identical so this works. If the processor pipeline
@@ -668,7 +704,7 @@ class DAggerStrategy(RolloutStrategy):
 
         elif old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
             logger.info("Entering correction mode - human teleop control")
-            if not teleop_supports_feedback(teleop) and prev_action is not None:
+            if not supports_feedback and prev_action is not None:
                 logger.info("Smooth handover: sliding follower to teleop position")
                 obs = robot.get_observation()
                 teleop_action = teleop.get_action()
@@ -677,11 +713,11 @@ class DAggerStrategy(RolloutStrategy):
                 follower_smooth_move_to(robot, prev_action, target)
 
             # unlock the teleop for human control
-            if teleop_supports_feedback(teleop):
+            if supports_feedback and not continuous_feedback:
                 teleop.disable_torque()
 
         elif old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
-            if teleop_supports_feedback(teleop):
+            if supports_feedback and not continuous_feedback:
                 teleop.enable_torque()
 
         elif new_phase == DAggerPhase.AUTONOMOUS:
@@ -691,7 +727,7 @@ class DAggerStrategy(RolloutStrategy):
             engine.resume()
 
             # release teleop before resuming the policy
-            if teleop_supports_feedback(teleop):
+            if supports_feedback and not continuous_feedback:
                 teleop.disable_torque()
 
     # ------------------------------------------------------------------

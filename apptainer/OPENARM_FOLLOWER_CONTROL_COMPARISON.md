@@ -1,12 +1,13 @@
 # OpenArm leader/follower制御設定の比較
 
-この文書は、次の5つの動作におけるOpenArm leader/followerの制御設定を比較したものです。
+この文書は、次の6つの動作におけるOpenArm leader/followerの制御設定を比較したものです。
 
 1. `dora-openarm-data-collection`でのbilateral teleop
 2. bilateral teleop起動・終了時の姿勢移動CSV再生
 3. LeRobotでのbilateral teleop・データ収集
-4. LeRobotでのpolicyデプロイ（推論中）
-5. LeRobot起動・終了時の姿勢移動CSV再生
+4. LeRobot DAggerでのpolicy推論・人介入
+5. LeRobotでのpolicyデプロイ（推論中）
+6. LeRobot起動・終了時の姿勢移動CSV再生
 
 値は現在の作業ツリーにおける既定値です。配列と表の関節順序は
 `J1, J2, J3, J4, J5, J6, J7, gripper`です。Dora/native側の位置はrad、
@@ -19,6 +20,7 @@ LeRobotの公開actionと関節制限はmotor-zero基準のdegreeで扱われま
 | Dora bilateral teleop | nativeのrole別PD | あり | あり | 通常テレオペ中は後述のCSV用関節制限でclipしない。送信前にDamiao motor固有のMIT制御範囲を検査し、違反時はモータをdisableする |
 | Dora 姿勢移動CSV再生 | 原則としてbilateral teleopと同じPD | 原則としてあり | 原則としてあり | 再生開始前にnative側の関節角度・速度制限でCSVを検証する。再生中のtracking error上限は`0.35 rad` |
 | LeRobot bilateral teleop・収集 | nativeのrole別PD | あり | あり | follower actionは左右別安全範囲へclipする。leader feedbackはOpenArm Descriptionの左右別物理範囲を外れると拒否し、bimanual feedbackエラーでは両leaderをdisableする |
+| LeRobot DAgger | nativeのrole別PD | あり | あり | autonomous・paused・correctingの全phaseで実測follower姿勢をleaderへ返す。OpenArm leaderのトルクをphase遷移でdisableせず、policy推論中と人介入中の両方でbilateral制御を維持する |
 | LeRobot policyデプロイ | bilateral followerと同じPD | あり | あり | 左右別の安全制限内へ各actionをclipする。`max_relative_target`は既定で無効 |
 | LeRobot 姿勢移動CSV再生 | bilateral followerと同じPD | あり | あり | CSVを左右別の制限で事前検証し、送信時にも同じ範囲へclipする。clipまたはtracking errorを検出すると再生を中止する。起動時エラーは両followerをdisableし、終了復帰時エラーは既定で現在姿勢を保持してCAN切断時もトルクを維持する |
 
@@ -36,6 +38,7 @@ MIT制御コマンドの速度目標は`0`、トルクフィードフォワー�
 | Dora bilateral teleop | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 | Dora 姿勢移動CSV再生 | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 | LeRobot bilateral teleop・収集 | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
+| LeRobot DAgger | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 | LeRobot policyデプロイ | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 | LeRobot 姿勢移動CSV再生 | `240 / 3` | `240 / 3` | `240 / 3` | `240 / 3` | `24 / 0.2` | `31 / 0.2` | `25 / 0.2` | `16 / 0.2` |
 
@@ -54,6 +57,7 @@ LeRobot bilateral teleop・収集では、各followerの観測姿勢を同じ側
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Dora bilateral teleop | `192 / 3` | `192 / 3` | `192 / 3` | `96 / 3` | `19.2 / 0.2` | `24.8 / 0.2` | `20 / 0.2` | `16 / 0.2` |
 | LeRobot bilateral teleop・収集 | `192 / 3` | `192 / 3` | `192 / 3` | `96 / 3` | `19.2 / 0.2` | `24.8 / 0.2` | `20 / 0.2` | `16 / 0.2` |
+| LeRobot DAgger | `192 / 3` | `192 / 3` | `192 / 3` | `96 / 3` | `19.2 / 0.2` | `24.8 / 0.2` | `20 / 0.2` | `16 / 0.2` |
 
 Doraの既定`J7_TUNING_PROFILE=validated`はleader J7を`Kp=20`にします。現在の
 `leader.yaml`も同じ値を持つため、LeRobotの実効既定値も`20 / 0.2`です。
@@ -79,6 +83,7 @@ followerは通常のbilateral PDではなく、次の低いゲインを使用し
 | Dora bilateral teleop | `gravity + friction` | `friction` | なし（計算するが指令には加算しない） |
 | Dora 姿勢移動CSV再生 | `gravity + friction` | `friction` | なし（現在姿勢からホーム姿勢までの例外区間は全項目`0`） |
 | LeRobot bilateral teleop・収集（leader/follower） | `gravity + friction` | `friction` | なし |
+| LeRobot DAgger（leader/follower） | `gravity + friction` | `friction` | なし |
 | LeRobot policyデプロイ | `gravity + friction` | `friction` | なし |
 | LeRobot 姿勢移動CSV再生 | `gravity + friction` | `friction` | なし |
 
@@ -181,6 +186,7 @@ policy action送信エラーは引き続き両followerをdisableします。
 - LeRobot leaderのPD・補償設定: [`../src/lerobot/teleoperators/openarm_leader/config_openarm_leader.py`](../src/lerobot/teleoperators/openarm_leader/config_openarm_leader.py)
 - LeRobotの共通重力・摩擦式: [`../src/lerobot/robots/openarm_follower/openarm_dynamics.py`](../src/lerobot/robots/openarm_follower/openarm_dynamics.py)
 - LeRobot leader feedback送信: [`../src/lerobot/teleoperators/openarm_leader/openarm_leader.py`](../src/lerobot/teleoperators/openarm_leader/openarm_leader.py)
+- LeRobot DAggerの連続feedbackとphase遷移: [`../src/lerobot/rollout/strategies/dagger.py`](../src/lerobot/rollout/strategies/dagger.py)
 - LeRobot action送信: [`../src/lerobot/robots/openarm_follower/openarm_follower.py`](../src/lerobot/robots/openarm_follower/openarm_follower.py)
 - LeRobot CSV検証: [`../src/lerobot/robots/bi_openarm_follower/deployment_trajectory.py`](../src/lerobot/robots/bi_openarm_follower/deployment_trajectory.py)
 - LeRobot CSV再生: [`../src/lerobot/robots/bi_openarm_follower/bi_openarm_follower.py`](../src/lerobot/robots/bi_openarm_follower/bi_openarm_follower.py)

@@ -304,6 +304,60 @@ Likewise, `max_relative_target` limits policy actions but is deliberately not
 applied to the validated zero/CSV deployment trajectory, which already has
 joint-limit, velocity, exact-target clipping, and tracking-error checks.
 
+## Run DAgger With OpenArm Bilateral Intervention
+
+DAgger starts in autonomous policy mode. For a keyboard-controlled session,
+press Space to pause policy execution, Tab to start or finish a human
+correction, Space from the paused phase to resume the policy, and Escape to
+stop the session. Enter requests a Hub upload in corrections-only mode. The
+default `record_autonomous=false` stores each Tab-to-Tab correction window as
+one episode; set it to `true` to store autonomous frames too and tag correction
+frames with `intervention=true`.
+
+Start from the full `lerobot-rollout` command above, retain its policy,
+follower, camera, deployment-trajectory, task, and runtime arguments, replace
+`--strategy.type=base`, and add the following arguments:
+
+```bash
+ROOT="./data/rollout_openarm_dagger_$(date +%Y%m%d_%H%M%S)"
+```
+
+The CLI fragment to append is:
+
+```text
+--strategy.type=dagger
+--strategy.record_autonomous=false
+--strategy.num_episodes=10
+--strategy.input_device=keyboard
+--teleop.type=bi_openarm_leader
+--teleop.left_arm_config.port=can1
+--teleop.right_arm_config.port=can0
+--teleop.id=openarm_v1_leader
+--dataset.repo_id=${HF_USER:-local}/rollout_openarm_dagger
+--dataset.root=$ROOT
+--dataset.single_task="Pick up the red cube and place it in the tray"
+--dataset.fps=30
+--dataset.num_episodes=10
+--dataset.push_to_hub=false
+--dataset.streaming_encoding=true
+--dataset.encoder_threads=2
+```
+
+For `openarm_leader` and `bi_openarm_leader`, DAgger sends the measured
+follower observation back to the leader in autonomous, paused, and correcting
+phases. It does not run the generic blocking leader handover or disable/re-enable
+leader torque at phase boundaries. Therefore the native-aligned leader PD,
+gravity compensation, friction compensation, and bilateral force response stay
+active both while the policy drives the follower and while the person moves the
+leader to correct it. The follower continues to use its native-aligned PD and
+compensation for policy and correction actions.
+
+Do not set `teleop.{left,right}_arm_config.manual_control=true` for this DAgger
+mode: that is a torque-disabled diagnostic and deliberately opts out of
+continuous bilateral feedback. Support all four arms, align each leader with
+its follower before connection, test at conservative follower relative-action
+limits, and perform a fresh physical validation before collecting task data.
+
 LeRobot also applies the native role-specific gravity and friction feed-forward
 terms: to leaders during bilateral teleoperation/recording, and to followers
 during teleoperation, policy inference, and trajectory motions. The wrapper

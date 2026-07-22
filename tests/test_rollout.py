@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -336,6 +336,137 @@ def test_dagger_events_reset():
     events.reset()
     assert events.phase == DAggerPhase.AUTONOMOUS
     assert not events.upload_requested.is_set()
+
+
+def test_dagger_continuous_feedback_routes_measured_follower_observation():
+    from lerobot.rollout.strategies.dagger import _send_continuous_feedback
+
+    observation = {"joint_1.pos": 12.5}
+    teleop = MagicMock()
+    teleop.requires_continuous_feedback = True
+
+    _send_continuous_feedback(teleop, observation)
+
+    teleop.send_feedback.assert_called_once_with(observation)
+
+
+def test_dagger_skips_continuous_feedback_for_other_teleoperators():
+    from lerobot.rollout.strategies.dagger import _send_continuous_feedback
+
+    teleop = MagicMock()
+    teleop.requires_continuous_feedback = False
+
+    _send_continuous_feedback(teleop, {"joint_1.pos": 12.5})
+
+    teleop.send_feedback.assert_not_called()
+
+
+def test_dagger_openarm_transitions_keep_bilateral_feedback_torque_enabled():
+    from lerobot.rollout import DAggerStrategy
+    from lerobot.rollout.strategies import DAggerPhase
+
+    teleop = MagicMock()
+    teleop.feedback_features = {"joint_1.pos": float}
+    teleop.requires_continuous_feedback = True
+    ctx = MagicMock()
+    ctx.hardware.teleop = teleop
+    engine = MagicMock()
+    interpolator = MagicMock()
+    action = {"joint_1.pos": 10.0}
+
+    with patch("lerobot.rollout.strategies.dagger.teleop_smooth_move_to") as smooth_move:
+        DAggerStrategy._apply_transition(
+            DAggerPhase.AUTONOMOUS,
+            DAggerPhase.PAUSED,
+            engine,
+            interpolator,
+            ctx,
+            action,
+        )
+        DAggerStrategy._apply_transition(
+            DAggerPhase.PAUSED,
+            DAggerPhase.CORRECTING,
+            engine,
+            interpolator,
+            ctx,
+            action,
+        )
+        DAggerStrategy._apply_transition(
+            DAggerPhase.CORRECTING,
+            DAggerPhase.PAUSED,
+            engine,
+            interpolator,
+            ctx,
+            action,
+        )
+        DAggerStrategy._apply_transition(
+            DAggerPhase.PAUSED,
+            DAggerPhase.AUTONOMOUS,
+            engine,
+            interpolator,
+            ctx,
+            action,
+        )
+
+    smooth_move.assert_not_called()
+    teleop.disable_torque.assert_not_called()
+    teleop.enable_torque.assert_not_called()
+    engine.pause.assert_called_once_with()
+    engine.reset.assert_called_once_with()
+    engine.resume.assert_called_once_with()
+    interpolator.reset.assert_called_once_with()
+
+
+def test_dagger_generic_actuated_teleop_keeps_existing_handover_behavior():
+    from lerobot.rollout import DAggerStrategy
+    from lerobot.rollout.strategies import DAggerPhase
+
+    teleop = MagicMock()
+    teleop.feedback_features = {"joint_1.pos": float}
+    teleop.requires_continuous_feedback = False
+    ctx = MagicMock()
+    ctx.hardware.teleop = teleop
+    engine = MagicMock()
+    interpolator = MagicMock()
+    action = {"joint_1.pos": 10.0}
+
+    with patch("lerobot.rollout.strategies.dagger.teleop_smooth_move_to") as smooth_move:
+        DAggerStrategy._apply_transition(
+            DAggerPhase.AUTONOMOUS,
+            DAggerPhase.PAUSED,
+            engine,
+            interpolator,
+            ctx,
+            action,
+        )
+        DAggerStrategy._apply_transition(
+            DAggerPhase.PAUSED,
+            DAggerPhase.CORRECTING,
+            engine,
+            interpolator,
+            ctx,
+            action,
+        )
+        DAggerStrategy._apply_transition(
+            DAggerPhase.CORRECTING,
+            DAggerPhase.PAUSED,
+            engine,
+            interpolator,
+            ctx,
+            action,
+        )
+        DAggerStrategy._apply_transition(
+            DAggerPhase.PAUSED,
+            DAggerPhase.AUTONOMOUS,
+            engine,
+            interpolator,
+            ctx,
+            action,
+        )
+
+    smooth_move.assert_called_once_with(teleop, action)
+    assert teleop.disable_torque.call_count == 2
+    teleop.enable_torque.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
