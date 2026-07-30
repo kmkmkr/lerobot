@@ -193,14 +193,50 @@ class DAggerPhase(enum.Enum):
     CORRECTING = "correcting"  # Human driving via teleop, recording interventions
 
 
-def _set_robot_intervention_phase(
-    robot_wrapper, old_phase: DAggerPhase, new_phase: DAggerPhase
-) -> None:
+# Runtime capability marker for out-of-tree phase-aware robot integrations.
+# Version 2 includes both transition boundaries and the mandatory loop-exit
+# PAUSED boundary before dataset persistence or other potentially slow teardown.
+DAGGER_INTERVENTION_PHASE_HOOK_VERSION = 2
+
+
+def _set_robot_intervention_phase(robot_wrapper, old_phase: DAggerPhase, new_phase: DAggerPhase) -> None:
     """Notify robots that opt into DAgger intervention phase changes."""
     robot = getattr(robot_wrapper, "inner", robot_wrapper)
     set_phase = getattr(robot, "set_intervention_phase", None)
     if callable(set_phase):
         set_phase(old_phase.value, new_phase.value)
+
+
+def _pause_dagger_control_before_loop_exit(engine, events: DAggerEvents, robot_wrapper) -> None:
+    """Stop inference and put phase-aware hardware in PAUSED before slow teardown.
+
+    Both operations are attempted even if the other one fails. This is called
+    from each control-loop ``finally`` block, so Esc, duration expiry, and every
+    exception share the same early hold boundary.
+    """
+    errors: list[BaseException] = []
+    try:
+        engine.pause()
+    except BaseException as error:
+        errors.append(error)
+
+    # Always issue the PAUSED notification, even when the event state already
+    # says PAUSED. A transition may have failed after changing hardware but
+    # before its event-state bookkeeping was committed or rolled back. Phase
+    # hook v2 therefore defines PAUSED as an idempotent fail-safe request.
+    old_phase = events.phase
+    try:
+        _set_robot_intervention_phase(robot_wrapper, old_phase, DAggerPhase.PAUSED)
+    except BaseException as error:
+        errors.append(error)
+    else:
+        events.phase = DAggerPhase.PAUSED
+
+    if errors:
+        primary = errors[0]
+        for additional in errors[1:]:
+            primary.add_note(f"Additional DAgger exit-pause error: {additional!r}")
+        raise primary
 
 
 # Valid (current_phase, event) -> next_phase
@@ -739,14 +775,21 @@ class DAggerStrategy(RolloutStrategy):
                     if transition is not None:
                         old_phase, new_phase = transition
                         entered_paused = new_phase == DAggerPhase.PAUSED
-                        resume_pending = self._apply_transition(
-                            old_phase,
-                            new_phase,
-                            engine,
-                            interpolator,
-                            ctx,
-                            last_action,
-                        )
+                        try:
+                            resume_pending = self._apply_transition(
+                                old_phase,
+                                new_phase,
+                                engine,
+                                interpolator,
+                                ctx,
+                                last_action,
+                            )
+                        except BaseException:
+                            # consume_transition updates the event state before
+                            # hardware side effects. Restore it so the exit
+                            # boundary can retry old_phase -> PAUSED safely.
+                            events.phase = old_phase
+                            raise
 
                     phase = events.phase
                     obs = robot.get_observation()
@@ -868,16 +911,17 @@ class DAggerStrategy(RolloutStrategy):
                 ctx.hardware.control_fault = error
                 raise
             finally:
-                logger.info("DAgger continuous control loop ended — pausing engine")
+                logger.info("DAgger continuous control loop ended — entering PAUSED hold")
                 active_error = sys.exception()
                 try:
-                    engine.pause()
+                    _pause_dagger_control_before_loop_exit(engine, events, robot)
                 except BaseException as pause_error:
+                    if ctx.hardware.control_fault is None:
+                        ctx.hardware.control_fault = active_error or pause_error
                     if active_error is None:
-                        ctx.hardware.control_fault = pause_error
                         raise
-                    active_error.add_note(f"Additional engine pause error: {pause_error!r}")
-                    logger.exception("Engine pause also failed; preserving the control-loop error")
+                    active_error.add_note(f"Additional DAgger exit-pause error: {pause_error!r}")
+                    logger.exception("DAgger exit PAUSED boundary also failed")
 
         self._raise_if_engine_failed(engine, ctx)
         self._raise_if_shutdown_requested(ctx)
@@ -952,14 +996,20 @@ class DAggerStrategy(RolloutStrategy):
                     if transition is not None:
                         old_phase, new_phase = transition
                         entered_paused = new_phase == DAggerPhase.PAUSED
-                        resume_pending = self._apply_transition(
-                            old_phase,
-                            new_phase,
-                            engine,
-                            interpolator,
-                            ctx,
-                            last_action,
-                        )
+                        try:
+                            resume_pending = self._apply_transition(
+                                old_phase,
+                                new_phase,
+                                engine,
+                                interpolator,
+                                ctx,
+                                last_action,
+                            )
+                        except BaseException:
+                            # See the continuous-mode path: preserve the last
+                            # fully applied phase for the exit PAUSED retry.
+                            events.phase = old_phase
+                            raise
 
                         # Persist in the background while PAUSED hold and feedback
                         # continue at the control-loop frequency.
@@ -1068,16 +1118,17 @@ class DAggerStrategy(RolloutStrategy):
                 ctx.hardware.control_fault = error
                 raise
             finally:
-                logger.info("DAgger corrections-only loop ended — pausing engine")
+                logger.info("DAgger corrections-only loop ended — entering PAUSED hold")
                 active_error = sys.exception()
                 try:
-                    engine.pause()
+                    _pause_dagger_control_before_loop_exit(engine, events, robot)
                 except BaseException as pause_error:
+                    if ctx.hardware.control_fault is None:
+                        ctx.hardware.control_fault = active_error or pause_error
                     if active_error is None:
-                        ctx.hardware.control_fault = pause_error
                         raise
-                    active_error.add_note(f"Additional engine pause error: {pause_error!r}")
-                    logger.exception("Engine pause also failed; preserving the control-loop error")
+                    active_error.add_note(f"Additional DAgger exit-pause error: {pause_error!r}")
+                    logger.exception("DAgger exit PAUSED boundary also failed")
 
         self._raise_if_engine_failed(engine, ctx)
         self._raise_if_shutdown_requested(ctx)
@@ -1103,9 +1154,11 @@ class DAggerStrategy(RolloutStrategy):
             Continuous-feedback teleops already track measured follower state,
             so they do not need this blocking handover.
 
-        PAUSED -> CORRECTING (non-actuated teleop):
+        PAUSED -> CORRECTING (ordinary non-actuated teleop):
             Slide the follower to the teleop's current pose so the robot meets
             the operator's hand rather than jumping to it on the first frame.
+            Teleops declaring continuous external feedback already own their
+            handover and skip this blocking Python interpolation.
 
         CORRECTING -> PAUSED (actuated teleop):
             Re-enable torque to hold position after correction.
@@ -1144,7 +1197,7 @@ class DAggerStrategy(RolloutStrategy):
         elif old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
             _set_robot_intervention_phase(robot, old_phase, new_phase)
             logger.info("Entering correction mode - human teleop control")
-            if not supports_feedback and prev_action is not None:
+            if not supports_feedback and not continuous_feedback and prev_action is not None:
                 logger.info("Smooth handover: sliding follower to teleop position")
                 obs = robot.get_observation()
                 teleop_action = teleop.get_action()

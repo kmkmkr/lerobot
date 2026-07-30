@@ -1,13 +1,14 @@
 # OpenArm leader/follower制御設定の比較
 
-この文書は、次の6つの動作におけるOpenArm leader/followerの制御設定を比較したものです。
+この文書は、次の7つの動作におけるOpenArm leader/followerの制御設定を比較したものです。
 
 1. `dora-openarm-data-collection`でのbilateral teleop
 2. bilateral teleop起動・終了時の姿勢移動CSV再生
 3. LeRobotでのbilateral teleop・データ収集
 4. LeRobot DAggerでのpolicy推論・人介入
-5. LeRobotでのpolicyデプロイ（推論中）
-6. LeRobot起動・終了時の姿勢移動CSV再生
+5. native RT bridgeを用いるLeRobot DAggerでのpolicy推論・人介入
+6. LeRobotでのpolicyデプロイ（推論中）
+7. LeRobot起動・終了時の姿勢移動CSV再生
 
 値は現在の作業ツリーにおける既定値です。配列と表の関節順序は
 `J1, J2, J3, J4, J5, J6, J7, gripper`です。Dora/native側の位置はrad、
@@ -20,14 +21,24 @@ LeRobotの公開actionと関節制限はmotor-zero基準のdegreeで扱われま
 | Dora bilateral teleop | nativeのrole別PD | あり | あり | 通常テレオペ中は後述のCSV用関節制限でclipしない。送信前にDamiao motor固有のMIT制御範囲を検査し、違反時はモータをdisableする |
 | Dora 姿勢移動CSV再生 | 原則としてbilateral teleopと同じPD | 原則としてあり | 原則としてあり | 再生開始前にnative側の関節角度・速度制限でCSVを検証する。再生中のtracking error上限は`0.35 rad` |
 | LeRobot bilateral teleop・収集 | nativeのrole別PD | あり | あり | follower actionは左右別安全範囲へclipする。leader feedbackはOpenArm Descriptionの左右別物理範囲を外れると拒否し、bimanual feedbackエラーでは両leaderをdisableする |
-| LeRobot DAgger | nativeのrole別PD | あり | あり | 起動時はleader/followerが各自の実測姿勢からzeroへ移動し、同じCSV目標をtask-readyまで再生する。その後はautonomous・paused・correctingの全phaseで実測follower姿勢をleaderへ返す。終了時は4台で同じ逆CSVをzeroまで再生する |
+| LeRobot DAgger（direct CAN） | nativeのrole別PD | あり | あり | 起動時はleader/followerが各自の実測姿勢からzeroへ移動し、同じCSV目標をtask-readyまで再生する。その後はautonomous・paused・correctingの全phaseで実測follower姿勢をleaderへ返す。終了時は4台で同じ逆CSVをzeroまで再生する |
+| LeRobot DAgger（native RT bridge） | native controller内のrole別PD | あり | あり | nativeの左右別processが4つのCANを専有し、leader feedbackとfollower制御を1 kHz周期で実行する。LeRobotはUnix socket越しに30 Hzのpolicy目標、phase、観測を扱う。policy目標はpluginでclipしnativeでも再検査する |
 | LeRobot policyデプロイ | bilateral followerと同じPD | あり | あり | 左右別の安全制限内へ各actionをclipする。`max_relative_target`は既定で無効 |
 | LeRobot 姿勢移動CSV再生 | nativeのrole別PD | あり | あり | 通常rolloutは両follower、DAgger介入は左右leader/followerの4台で再生する。CSVを左右別の制限で事前検証し、送信時にも同じ範囲へclipする。clipまたはtracking errorを検出すると再生を中止する |
 
-LeRobotではleader feedback、policy推論、CSV再生のPDゲインを独立して設定できます。
+direct-CAN LeRobotではleader feedback、policy推論、CSV再生のPDゲインを独立して設定できます。
 既定値はそれぞれnative bilateralの同じroleを正として揃えています。位置のみの標準構成では
 MIT制御コマンドの速度目標は`0`、トルクフィードフォワードはnativeと同じ重力補償と
 摩擦補償の和です。follower観測に`.vel`が含まれる場合、leader feedbackはその速度も参照します。
+
+native RT bridgeではPDゲインと補償をLeRobot pluginへ複製しません。native
+`bilateral_control`が同じ`leader.yaml`、`follower.yaml`と実効J7 tuningを直接使用します。
+LeRobot公開境界の位置・速度はdegreeとdegree/s、socket上はradとrad/s、torqueは両方でN.mです。
+現在のDora変換dataset/checkpoint metadataは全要素`0`のtorque観測channelを持つため、
+raw APIの互換値は`torque_observation_mode=zero`です。`measured`はraw Robot APIでnativeの
+実測値を公開しますが、現行rolloutは`.pos`とcameraだけをdataset/policyへ集約し、現在の
+GR00T pack stepも16-D position stateだけを消費します。実測torqueを保存・利用するには、
+別のprocessor/context schemaと、それに対応するdataset/checkpointが必要です。
 
 ## follower PDゲイン
 

@@ -24,6 +24,48 @@ for a comparison of leader/follower PD gains, gravity/friction compensation,
 and joint limits across bilateral collection, policy inference, and their
 startup/shutdown trajectory motions.
 
+### Native 1 kHz bridge for DAgger
+
+For full-size OpenArm leader intervention, the superproject also provides an
+out-of-tree `lerobot-openarm-rt` plugin and a fail-closed launcher. In this
+mode, the two native `bilateral_control` processes retain exclusive ownership
+of all four CAN interfaces and run each left/right leader-follower control pair
+at the native 1 kHz period. LeRobot communicates over two local Unix sockets
+and remains responsible for policy inference, 30 Hz cameras, phase events, and
+dataset recording. It never opens an OpenArm CAN interface in this mode.
+
+The native processes implement the phase behavior directly:
+
+- `autonomous`: leader follows measured follower feedback; follower tracks a
+  rate-limited policy target and holds its measured pose until the first fresh
+  target after every resume.
+- `paused`: follower holds its measured pose and no policy target is accepted.
+- `correcting`: follower follows the measured leader inside the 1 kHz loop;
+  the native role-specific bilateral gains and compensation remain active.
+- `fault`: a healthy native side rejects new client motion targets and enters
+  measured hold. A native control-loop, measurement, or motor-command failure
+  may disable torque and exit; no fault initiates an automatic return trajectory.
+
+This avoids implementing a 1 kHz torque loop in Python and keeps the native
+Dora controller as the source of truth. Only a small, generic opt-in
+`set_intervention_phase(old_phase, new_phase)` notification hook lives in the
+LeRobot checkout; the production RT path requires its version-2 transition and
+loop-exit PAUSED boundaries. Plugin discovery, the socket protocol, and
+OpenArm-specific state handling stay outside LeRobot. This separation is
+intended to reduce conflicts when merging future upstream LeRobot updates.
+
+For current checkpoint metadata and converted Dora datasets, the launcher
+explicitly selects `robot.torque_observation_mode=zero` for the legacy raw
+channel. `measured` exposes native motor torque in N.m at the raw Robot API.
+The current rollout feature aggregation still routes only `.pos` and cameras
+to the policy and dataset, and the supplied GR00T pack step consumes the 16-D
+position state. Persisting velocity or measured torque requires a deliberately
+separated processor/context schema and a consistently trained checkpoint. See
+the superproject guide at
+[`../../docs/OPENARM_RT_BRIDGE.md`](../../docs/OPENARM_RT_BRIDGE.md) before
+hardware use. The bridge implementation has software tests, but still requires
+a supported-arm, low-risk physical validation before normal operation.
+
 ## Build
 
 From the LeRobot repository root:

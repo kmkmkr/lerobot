@@ -24,11 +24,13 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 from lerobot.rollout import DAggerStrategyConfig, HardwareContext
 from lerobot.rollout.strategies.core import RolloutStrategy
 from lerobot.rollout.strategies.dagger import (
+    DAGGER_INTERVENTION_PHASE_HOOK_VERSION,
     DAggerEvents,
     DAggerPhase,
     DAggerStrategy,
     PolicyActionRateLimiter,
     _init_dagger_keyboard,
+    _pause_dagger_control_before_loop_exit,
 )
 
 
@@ -179,6 +181,7 @@ def test_dagger_resume_notifies_fresh_observation_before_engine_resume() -> None
 
 
 def test_dagger_notifies_inner_robot_of_phase_changes_in_safe_order() -> None:
+    assert DAGGER_INTERVENTION_PHASE_HOOK_VERSION == 2
     calls: list[str] = []
 
     class PhaseAwareRobot:
@@ -218,6 +221,90 @@ def test_dagger_notifies_inner_robot_of_phase_changes_in_safe_order() -> None:
         "engine.reset",
     ]
     engine.resume.assert_not_called()
+
+
+def test_dagger_external_continuous_feedback_skips_blocking_follower_handover() -> None:
+    teleop = SimpleNamespace(
+        feedback_features={},
+        requires_continuous_feedback=True,
+    )
+    robot = SimpleNamespace(inner=object())
+    ctx = SimpleNamespace(
+        hardware=SimpleNamespace(robot_wrapper=robot, teleop=teleop),
+    )
+
+    with patch("lerobot.rollout.strategies.dagger.follower_smooth_move_to") as smooth_move:
+        assert not DAggerStrategy._apply_transition(
+            DAggerPhase.PAUSED,
+            DAggerPhase.CORRECTING,
+            MagicMock(),
+            MagicMock(),
+            ctx,
+            {"joint_1.pos": 1.0},
+        )
+
+    smooth_move.assert_not_called()
+
+
+def test_dagger_exit_pauses_phase_aware_robot_before_slow_teardown() -> None:
+    calls: list[str] = []
+
+    class PhaseAwareRobot:
+        def set_intervention_phase(self, old_phase: str, new_phase: str) -> None:
+            calls.append(f"phase:{old_phase}->{new_phase}")
+
+    engine = MagicMock()
+    engine.pause.side_effect = lambda: calls.append("engine.pause")
+    events = DAggerEvents()
+    events.phase = DAggerPhase.CORRECTING
+
+    _pause_dagger_control_before_loop_exit(
+        engine,
+        events,
+        SimpleNamespace(inner=PhaseAwareRobot()),
+    )
+
+    assert calls == ["engine.pause", "phase:correcting->paused"]
+    assert events.phase is DAggerPhase.PAUSED
+
+
+def test_dagger_exit_attempts_phase_hold_when_engine_pause_fails() -> None:
+    calls: list[str] = []
+    pause_error = RuntimeError("engine pause failed")
+
+    class PhaseAwareRobot:
+        def set_intervention_phase(self, old_phase: str, new_phase: str) -> None:
+            calls.append(f"phase:{old_phase}->{new_phase}")
+
+    engine = MagicMock()
+    engine.pause.side_effect = pause_error
+    events = DAggerEvents()
+    events.phase = DAggerPhase.AUTONOMOUS
+
+    with pytest.raises(RuntimeError, match="engine pause failed") as exc_info:
+        _pause_dagger_control_before_loop_exit(
+            engine,
+            events,
+            SimpleNamespace(inner=PhaseAwareRobot()),
+        )
+
+    assert exc_info.value is pause_error
+    assert calls == ["phase:autonomous->paused"]
+    assert events.phase is DAggerPhase.PAUSED
+
+
+def test_dagger_exit_reissues_idempotent_paused_hook() -> None:
+    robot = SimpleNamespace(set_intervention_phase=MagicMock())
+    events = DAggerEvents()
+    events.phase = DAggerPhase.PAUSED
+
+    _pause_dagger_control_before_loop_exit(
+        MagicMock(),
+        events,
+        SimpleNamespace(inner=robot),
+    )
+
+    robot.set_intervention_phase.assert_called_once_with("paused", "paused")
 
 
 def test_dagger_phase_hook_is_optional_and_propagates_failures() -> None:
@@ -574,9 +661,7 @@ def test_dagger_teardown_marks_shutdown_signal_before_hardware_teardown() -> Non
         observed_faults.append(hardware.control_fault)
         hardware.teardown_complete = True
 
-    strategy._teardown_hardware = MagicMock(
-        side_effect=complete_hardware_teardown
-    )
+    strategy._teardown_hardware = MagicMock(side_effect=complete_hardware_teardown)
     dataset = MagicMock()
     dataset.has_pending_frames.return_value = False
     cfg = SimpleNamespace(
