@@ -117,6 +117,31 @@ class ActionQueue:
         with self.lock:
             return self.last_index
 
+    def snapshot_for_inference(self) -> tuple[int, int, Tensor | None, Tensor | None]:
+        """Atomically snapshot the queue state used to start an inference.
+
+        The control thread may consume actions while the RTC thread is preparing
+        its next chunk. Reading the index and the two leftover queues under one
+        lock keeps the model-space prefix aligned with the robot-space prefix.
+
+        Returns:
+            A tuple containing the number of remaining actions, the index of the
+            next action, the remaining original actions, and the remaining
+            processed actions. Returned tensors are clones.
+        """
+        with self.lock:
+            if self.queue is None:
+                remaining = 0
+                processed_left_over = None
+            else:
+                remaining = max(0, len(self.queue) - self.last_index)
+                processed_left_over = self.queue[self.last_index :].clone()
+
+            original_left_over = (
+                None if self.original_queue is None else self.original_queue[self.last_index :].clone()
+            )
+            return remaining, self.last_index, original_left_over, processed_left_over
+
     def get_left_over(self) -> Tensor | None:
         """Get leftover original actions for RTC prev_chunk_left_over.
 
@@ -229,18 +254,20 @@ class ActionQueue:
             action_index_before_inference: Action index when inference started.
 
         Returns:
-            int: Delay to use.
+            int: Delay to use. When an action index is supplied, this is the
+                number of actions actually consumed during inference.
         """
         effective_delay = max(0, real_delay)
 
         if action_index_before_inference is not None:
             indexes_diff = max(0, self.last_index - action_index_before_inference)
-            if indexes_diff != real_delay:
+            if indexes_diff != effective_delay:
                 logger.warning(
-                    "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
+                    "Indexes diff is not equal to real delay; using actions actually consumed. "
+                    "indexes_diff=%d, real_delay=%d",
                     indexes_diff,
                     real_delay,
                 )
-                return real_delay
+            return indexes_diff
 
         return effective_delay

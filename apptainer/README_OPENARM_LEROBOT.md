@@ -268,14 +268,13 @@ PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
 ```
 cd ~/gitrepo/openarm-bilateral-teleop-lerobot-deploy/lerobot
 
-POLICY_PATH=/home/mkj/gitrepo/openarm-bilateral-teleop-lerobot-deploy/checkpoint/VLA-JEPA-OpenArm-lerobot-merged-wrists-20k
+POLICY_PATH=/home/mkj/gitrepo/openarm-bilateral-teleop-lerobot-deploy/checkpoint/pi05_lora_21437/pretrained_model
 PROFILE=/workspace/openarm_startup_trajectories/task_ready_20260718_180030
 
 ./apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-rollout \
   --strategy.type=base \
   --inference.type=sync \
   --policy.path="$POLICY_PATH" \
-  --policy.qwen_model_name=Qwen/Qwen3-VL-2B-Instruct \
   --policy.device=cuda \
   --policy.n_action_steps=3 \
   --device=cuda \
@@ -313,10 +312,22 @@ joint-limit, velocity, exact-target clipping, and tracking-error checks.
 DAgger starts in autonomous policy mode. For a keyboard-controlled session,
 press Space to pause policy execution, Tab to start or finish a human
 correction, Space from the paused phase to resume the policy, and Escape to
-stop the session. Enter requests a Hub upload in corrections-only mode. The
-default `record_autonomous=false` stores each Tab-to-Tab correction window as
-one episode; set it to `true` to store autonomous frames too and tag correction
-frames with `intervention=true`.
+stop the session. Enter queues a Hub upload for after hardware shutdown and
+dataset finalization. Space after finishing a correction means
+`PAUSED -> AUTONOMOUS`; it does not start a new episode. The default
+`record_autonomous=false` stores each Tab-to-Tab correction window as one
+episode. Episode persistence runs in a single background worker while PAUSED
+feedback and measured-position hold commands continue. If Space or Tab is
+pressed before persistence completes, the request remains pending. With 10
+target episodes, `video_encoding_batch_size=11` defers AV1 encoding to
+`dataset.finalize()`, after hardware has been secured and disconnected. On
+Escape, duration expiry, or reaching the target episode count, hardware
+cleanup begins without waiting for a pending save; only after disconnect does
+teardown wait for the saver. A persistence or teardown error suppresses the
+final Hub push so a partial dataset is not published.
+`record_autonomous=true` is intentionally rejected for both single-arm and
+bimanual OpenArm until continuous-mode persistence is fully removed from the
+hardware control loop.
 
 Start from the full `lerobot-rollout` command above, retain its policy,
 follower, camera, deployment-trajectory, task, and runtime arguments, replace
@@ -333,9 +344,15 @@ The CLI fragment to append is:
 --strategy.record_autonomous=false
 --strategy.num_episodes=10
 --strategy.input_device=keyboard
+--strategy.resume_blend_duration_s=2.0
+--strategy.max_action_velocity=10.0
+--robot.left_arm_config.use_velocity_and_torque=true
+--robot.right_arm_config.use_velocity_and_torque=true
 --teleop.type=bi_openarm_leader
 --teleop.left_arm_config.port=can1
+--teleop.left_arm_config.use_velocity_and_torque=true
 --teleop.right_arm_config.port=can0
+--teleop.right_arm_config.use_velocity_and_torque=true
 --teleop.id=openarm_v1_leader
 --dataset.repo_id=${HF_USER:-local}/rollout_openarm_dagger
 --dataset.root=$ROOT
@@ -343,8 +360,10 @@ The CLI fragment to append is:
 --dataset.fps=30
 --dataset.num_episodes=10
 --dataset.push_to_hub=false
---dataset.streaming_encoding=true
---dataset.encoder_threads=2
+--dataset.streaming_encoding=false
+--dataset.video_encoding_batch_size=11
+--dataset.num_image_writer_threads_per_camera=2
+--dataset.encoder_threads=1
 ```
 
 For `openarm_leader` and `bi_openarm_leader`, DAgger sends the measured
@@ -356,6 +375,12 @@ active both while the policy drives the follower and while the person moves the
 leader to correct it. The follower continues to use its native-aligned PD and
 compensation for policy and correction actions.
 
+Enable `use_velocity_and_torque=true` on both followers and both leaders as in
+the fragment above. Measured follower velocity then reaches the leader feedback
+controller, and measured leader velocity reaches the follower MIT target. If it
+is omitted, target velocity defaults to zero and the bilateral leader can feel
+unnecessarily heavy while the person moves it.
+
 For `bi_openarm_follower`, OpenArm DAgger requires
 `robot.deployment_trajectory_profile`. It connects both followers and both
 leaders before startup motion. Each role blends from its own measured pose to
@@ -365,12 +390,25 @@ compensation; leaders use the native-aligned leader PD and compensation. At the
 handover to inference, the measured follower pose becomes the leader reference,
 so continuous bilateral feedback starts without a reference jump.
 
-With the default `return_to_initial_position=true`, shutdown blends all four
-devices back to the task-ready pose and replays the same reversed CSV to exact
-motor zero before disconnecting. A startup replay error disables all four
-devices. A shutdown-return error keeps all four holding their measured poses by
-default, including across CAN disconnect. The warning confirmation evaluates
-both leader and follower joints.
+Every start or `PAUSED -> AUTONOMOUS` transition resets the RTC queue and
+invalidates the previous observation generation. The main loop publishes a
+fresh measured observation before resuming inference; results started before a
+pause/reset are discarded. The first new chunk is consumed from step zero, and
+policy targets are blended from the measured handover pose for
+`resume_blend_duration_s` while `max_action_velocity` limits every control-tick
+step. An empty inference queue keeps sending a zero-velocity position hold.
+
+With the default `return_to_initial_position=true`, a normal orderly shutdown
+blends all four devices back to the task-ready pose and replays the same
+reversed CSV to exact motor zero before disconnecting. If a control, feedback,
+or recording fault occurs, that return trajectory is prohibited: all four
+devices are secured at freshly measured positions before CAN disconnect and
+dataset finalization. Only a device whose position command, torque-enable, and
+post-enable command all succeed is left holding across disconnect; a failed
+device is explicitly disabled and reported. A startup replay error disables all
+four devices. A failure during an otherwise normal shutdown return uses the
+same current-position hold. The warning confirmation evaluates both leader and
+follower joints.
 
 Do not set `teleop.{left,right}_arm_config.manual_control=true` for this DAgger
 mode: that is a torque-disabled diagnostic and deliberately opts out of
@@ -404,6 +442,11 @@ Relevant motion settings and defaults are:
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
+| `strategy.resume_blend_duration_s` | `2.0` | Fresh measured pose to policy target smoothstep duration |
+| `strategy.max_action_velocity` | `None` (`dagger.sh`: `10.0`) | Per-second autonomous action limit; degrees/s for OpenArm positions |
+| `robot.{left,right}_arm_config.use_velocity_and_torque` | `false` (`dagger.sh`: `true`) | Expose follower velocity for leader feedback |
+| `teleop.{left,right}_arm_config.use_velocity_and_torque` | `false` (`dagger.sh`: `true`) | Send measured leader velocity to follower MIT control |
+| `teleop.{left,right}_arm_config.feedback_position_limit_tolerance_deg` | `1.5` | Clamp only small measured boundary overshoot; larger values fault |
 | `robot.deployment_control_frequency_hz` | `50` | CSV interpolation/control rate |
 | `robot.startup_zero_pose_duration_s` | `2.2` | Current pose to exact zero |
 | `robot.startup_trajectory_speed` | `1.0` | Forward CSV speed scale |
@@ -413,7 +456,7 @@ Relevant motion settings and defaults are:
 | `robot.shutdown_zero_transition_s` | `1.0` | Recorded-time transition from first sample to exact zero |
 | `robot.shutdown_task_pose_warn_deg` | `28.6479` | Confirmation threshold, equivalent to `0.5 rad` |
 | `robot.deployment_tracking_error_deg` | `20.0535` | Motion-abort threshold, equivalent to `0.35 rad` |
-| `robot.deployment_start_limit_tolerance_deg` | `1.0` | Maximum measured blend-start overshoot that may be clamped to a joint limit |
+| `robot.deployment_start_limit_tolerance_deg` | `1.5` | Clamp the observed small gripper sensor overshoot (up to 1.5 deg); larger deviations fault |
 | `robot.hold_position_on_shutdown_error` | `true` | Keep torque enabled at the current pose if the shutdown return fails |
 
 The zero transition is part of the reverse trajectory and is therefore also

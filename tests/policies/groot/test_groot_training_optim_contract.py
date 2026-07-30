@@ -25,11 +25,26 @@ frozen LM-head weight tie, and episode-tail exclusion for incomplete chunks.
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.groot.groot_n1_7 import _tie_unused_qwen_lm_head
 from lerobot.policies.groot.modeling_groot import GrootPolicy
+
+
+def _make_dummy_policy_with_tied_qwen_weights() -> torch.nn.Module:
+    policy = torch.nn.Module()
+    policy._groot_model = torch.nn.Module()
+    policy._groot_model.backbone = torch.nn.Module()
+    policy._groot_model.backbone.model = torch.nn.Module()
+    qwen = policy._groot_model.backbone.model
+    qwen.model = torch.nn.Module()
+    qwen.model.language_model = torch.nn.Module()
+    qwen.model.language_model.embed_tokens = torch.nn.Embedding(7, 3)
+    qwen.lm_head = torch.nn.Linear(3, 7, bias=False)
+    qwen.lm_head.weight = qwen.model.language_model.embed_tokens.weight
+    return policy
 
 
 def test_groot_n1_7_optimizer_matches_isaac_training_contract():
@@ -101,6 +116,42 @@ def test_groot_n1_7_ties_unused_qwen_lm_head_to_frozen_input_embeddings():
 
     assert model.lm_head.weight is model.embed_tokens.weight
     assert len(list(model.parameters())) == 1
+
+
+def test_groot_strict_load_accepts_equivalent_materialized_qwen_tied_weights(tmp_path):
+    policy = _make_dummy_policy_with_tied_qwen_weights()
+    expected = next(policy.parameters()).detach().clone()
+    checkpoint = {key: value.detach().clone() for key, value in policy.state_dict().items()}
+    model_file = tmp_path / "model.safetensors"
+    save_file(checkpoint, model_file)
+
+    next(policy.parameters()).data.zero_()
+    loaded = GrootPolicy._load_as_safetensor(policy, str(model_file), "cpu", strict=True)
+
+    assert loaded is policy
+    torch.testing.assert_close(next(policy.parameters()), expected)
+
+
+def test_groot_strict_load_rejects_different_materialized_qwen_tied_weights(tmp_path):
+    policy = _make_dummy_policy_with_tied_qwen_weights()
+    checkpoint = {key: value.detach().clone() for key, value in policy.state_dict().items()}
+    checkpoint["_groot_model.backbone.model.lm_head.weight"].add_(1)
+    model_file = tmp_path / "model.safetensors"
+    save_file(checkpoint, model_file)
+
+    with pytest.raises(RuntimeError, match="their values differ"):
+        GrootPolicy._load_as_safetensor(policy, str(model_file), "cpu", strict=True)
+
+
+def test_groot_strict_load_still_rejects_other_unexpected_weights(tmp_path):
+    policy = _make_dummy_policy_with_tied_qwen_weights()
+    checkpoint = {key: value.detach().clone() for key, value in policy.state_dict().items()}
+    checkpoint["unexpected.weight"] = torch.ones(1)
+    model_file = tmp_path / "model.safetensors"
+    save_file(checkpoint, model_file)
+
+    with pytest.raises(RuntimeError, match='Unexpected key.*"unexpected.weight"'):
+        GrootPolicy._load_as_safetensor(policy, str(model_file), "cpu", strict=True)
 
 
 def test_groot_n1_7_optimizer_groups_match_transformers_weight_decay_rules():

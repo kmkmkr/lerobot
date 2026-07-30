@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import logging
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
@@ -35,6 +36,35 @@ if TYPE_CHECKING:
     from ..context import HardwareContext, ProcessorContext, RolloutContext, RuntimeContext
 
 logger = logging.getLogger(__name__)
+
+
+def _device_has_live_connection(device) -> bool:
+    """Detect complete and partial hardware connections during teardown."""
+    if device is None:
+        return False
+    any_arm_connected = getattr(type(device), "any_arm_connected", None)
+    if isinstance(any_arm_connected, property):
+        try:
+            if bool(device.any_arm_connected):
+                return True
+        except Exception:
+            pass
+    try:
+        if bool(device.is_connected):
+            return True
+    except Exception:
+        pass
+    bus = getattr(device, "bus", None)
+    try:
+        if bus is not None and bool(bus.is_connected):
+            return True
+    except Exception:
+        pass
+    cameras = getattr(device, "cameras", {})
+    try:
+        return any(bool(camera.is_connected) for camera in cameras.values())
+    except Exception:
+        return False
 
 
 class RolloutStrategy(abc.ABC):
@@ -92,7 +122,14 @@ class RolloutStrategy(abc.ABC):
             self._cached_obs_processed = obs_processed
         return self._cached_obs_processed
 
-    def _handle_warmup(self, use_torch_compile: bool, loop_start: float, control_interval: float) -> bool:
+    def _handle_warmup(
+        self,
+        use_torch_compile: bool,
+        loop_start: float,
+        control_interval: float,
+        *,
+        resume_after_reset: bool = True,
+    ) -> bool:
         """Handle torch.compile warmup phase.
 
         Returns ``True`` if the caller should ``continue`` (still warming
@@ -113,20 +150,90 @@ class RolloutStrategy(abc.ABC):
             engine.reset()
             interpolator.reset()
             self._warmup_flushed = True
-            engine.resume()
+            if resume_after_reset:
+                engine.resume()
         return False
 
+    def _secure_hardware_after_fault(self, robot, teleop) -> None:
+        """Use the strongest available no-motion safety hook."""
+        secure_intervention = getattr(robot, "secure_intervention_after_fault", None)
+        if (
+            self.config.type == "dagger"
+            and teleop is not None
+            and callable(secure_intervention)
+        ):
+            secure_intervention(teleop)
+            return
+
+        secure_after_fault = getattr(robot, "secure_after_fault", None)
+        if callable(secure_after_fault):
+            secure_after_fault()
+            return
+
+        logger.warning("Robot has no specialized fault-hold hook; disconnecting in place.")
+
     def _teardown_hardware(self, hw: HardwareContext, return_to_initial_position: bool = True) -> None:
-        """Stop the inference engine, optionally return robot to initial position, and disconnect hardware."""
+        """Secure and disconnect hardware before any dataset finalization.
+
+        A control fault prohibits automatic return motion. Specialized robots
+        may hold their measured pose; generic hardware disconnects in place.
+        """
+        if hw.teardown_complete:
+            return
+
+        engine_stop_error: BaseException | None = None
         if self._engine is not None:
             logger.info("Stopping inference engine...")
-            self._engine.stop()
+            try:
+                self._engine.stop()
+            except BaseException as error:
+                engine_stop_error = error
+                logger.exception("Failed to stop inference engine; continuing hardware shutdown")
+        if engine_stop_error is not None and hw.control_fault is None:
+            hw.control_fault = engine_stop_error
+
         robot = hw.robot_wrapper.inner
         teleop = hw.teleop
+        robot_connected = _device_has_live_connection(robot)
+        teleop_connected = _device_has_live_connection(teleop)
+        disconnect_complete = True
+        if (
+            self.config.type == "dagger"
+            and robot_connected != teleop_connected
+            and hw.control_fault is None
+        ):
+            hw.control_fault = RuntimeError(
+                "DAgger hardware connectivity became asymmetric during teardown"
+            )
+            logger.critical(
+                "Follower/teleoperator connectivity mismatch; prohibiting coordinated return motion"
+            )
         try:
-            if robot.is_connected:
+            # A follower may already have closed its CAN buses while one or
+            # both leaders are still live. The coordinated OpenArm fault hook
+            # remains responsible for every device that is still reachable;
+            # do not gate it solely on the follower connection state.
+            if (
+                not robot_connected
+                and teleop_connected
+                and hw.control_fault is not None
+                and self.config.type == "dagger"
+            ):
+                logger.critical(
+                    "Control fault detected with only the teleoperator still connected; "
+                    "securing the remaining intervention hardware in place."
+                )
+                self._secure_hardware_after_fault(robot, teleop)
+            if robot_connected:
                 try:
-                    if return_to_initial_position:
+                    if hw.control_fault is not None:
+                        logger.critical(
+                            "Control fault detected (%s); automatic return motion is prohibited. "
+                            "Securing hardware at its current pose.",
+                            type(hw.control_fault).__name__,
+                        )
+                        self._secure_hardware_after_fault(robot, teleop)
+                    elif return_to_initial_position:
                         finish_intervention_deployment = getattr(
                             robot, "finish_intervention_deployment", None
                         )
@@ -150,13 +257,47 @@ class RolloutStrategy(abc.ABC):
                         logger.info(
                             "Skipping shutdown return motion (disabled by config); leaving robot in final pose."
                         )
+                except BaseException as error:
+                    if hw.control_fault is None:
+                        hw.control_fault = error
+                    logger.critical(
+                        "Hardware shutdown motion/control was interrupted; "
+                        "securing the current pose before disconnect"
+                    )
+                    try:
+                        self._secure_hardware_after_fault(robot, teleop)
+                    except BaseException as secure_error:
+                        error.add_note(
+                            f"Additional current-pose safety hook error: {secure_error!r}"
+                        )
+                        logger.exception(
+                            "Current-pose safety hook also failed; continuing disconnect"
+                        )
+                    raise
                 finally:
                     logger.info("Disconnecting robot...")
-                    robot.disconnect()
+                    try:
+                        robot.disconnect()
+                    except BaseException:
+                        disconnect_complete = False
+                        raise
         finally:
-            if teleop is not None and teleop.is_connected:
-                logger.info("Disconnecting teleoperator...")
-                teleop.disconnect()
+            try:
+                teleop_connected = _device_has_live_connection(teleop)
+                if teleop_connected:
+                    logger.info("Disconnecting teleoperator...")
+                    try:
+                        teleop.disconnect()
+                    except BaseException:
+                        disconnect_complete = False
+                        raise
+            finally:
+                # A caller may safely retry when an asynchronous interruption
+                # or strict disconnect failure left a device unresolved.
+                hw.teardown_complete = disconnect_complete
+
+        if engine_stop_error is not None:
+            raise engine_stop_error
 
     @staticmethod
     def _return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> None:
@@ -293,6 +434,7 @@ def send_next_action(
     obs_raw: dict,
     ctx: RolloutContext,
     interpolator: ActionInterpolator,
+    action_filter: Callable[[dict[str, float]], dict[str, float]] | None = None,
 ) -> dict | None:
     """Dispatch the next action to the robot.
 
@@ -321,6 +463,8 @@ def send_next_action(
     if len(interp) != len(ordered_keys):
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
+    if action_filter is not None:
+        action_dict = action_filter(action_dict)
     processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
     ctx.hardware.robot_wrapper.send_action(processed)
     return action_dict

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import math
 from dataclasses import dataclass, field
 
 import draccus
@@ -185,6 +186,14 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     # Target video file size in MB for episode rotation (record_autonomous
     # mode only).  Defaults to DEFAULT_VIDEO_FILE_SIZE_IN_MB when None.
     target_video_file_size_mb: int | None = None
+    # On every transition back to autonomous control, blend policy targets
+    # from the freshly measured robot pose for this duration. This prevents
+    # the first post-intervention policy chunk from becoming a step command.
+    resume_blend_duration_s: float = 2.0
+    # Optional per-second limit in action units (degrees for OpenArm joint
+    # position actions). ``None`` keeps the generic strategy backwards
+    # compatible; safety-critical deployments should set it explicitly.
+    max_action_velocity: float | None = None
     input_device: str = "keyboard"
     keyboard: DAggerKeyboardConfig = field(default_factory=DAggerKeyboardConfig)
     pedal: DAggerPedalConfig = field(default_factory=DAggerPedalConfig)
@@ -192,6 +201,13 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     def __post_init__(self):
         if self.input_device not in ("keyboard", "pedal"):
             raise ValueError(f"DAgger input_device must be 'keyboard' or 'pedal', got '{self.input_device}'")
+
+        if not math.isfinite(self.resume_blend_duration_s) or self.resume_blend_duration_s < 0:
+            raise ValueError("DAgger resume_blend_duration_s must be finite and >= 0")
+        if self.max_action_velocity is not None and (
+            not math.isfinite(self.max_action_velocity) or self.max_action_velocity <= 0
+        ):
+            raise ValueError("DAgger max_action_velocity must be finite and > 0 when set")
 
 
 # ---------------------------------------------------------------------------
@@ -301,17 +317,18 @@ class RolloutConfig:
             logger.warning("Highlight mode forces streaming_encoding=True")
             self.dataset.streaming_encoding = True
 
-        # DAgger: streaming is mandatory only when the autonomous phase is also recorded.
+        # Continuous DAgger uses streaming workers. Corrections-only DAgger
+        # persists completed windows on a background worker while PAUSED.
         if isinstance(self.strategy, DAggerStrategyConfig) and self.dataset is not None:
             if self.strategy.record_autonomous and not self.dataset.streaming_encoding:
                 logger.warning("DAgger with record_autonomous=True forces streaming_encoding=True")
                 self.dataset.streaming_encoding = True
-            elif not self.strategy.record_autonomous and not self.dataset.streaming_encoding:
-                logger.info(
-                    "Streaming encoding is disabled for DAgger corrections-only mode. "
-                    "Consider enabling it for faster episode saving: "
-                    "--dataset.streaming_encoding=true --dataset.encoder_threads=2"
+            elif not self.strategy.record_autonomous and self.dataset.streaming_encoding:
+                logger.warning(
+                    "DAgger corrections-only mode forces streaming_encoding=False so codec startup "
+                    "and episode persistence run outside the hardware control loop"
                 )
+                self.dataset.streaming_encoding = False
 
         # DAgger: resolve num_episodes from dataset config when not explicitly set.
         if isinstance(self.strategy, DAggerStrategyConfig) and self.strategy.num_episodes is None:
@@ -326,9 +343,31 @@ class RolloutConfig:
                     "DAgger num_episodes must be set either via --strategy.num_episodes or --dataset.num_episodes"
                 )
 
+        if (
+            isinstance(self.strategy, DAggerStrategyConfig)
+            and not self.strategy.record_autonomous
+            and self.dataset is not None
+            and self.dataset.video
+        ):
+            minimum_batch_size = self.strategy.num_episodes + 1
+            if self.dataset.video_encoding_batch_size < minimum_batch_size:
+                logger.warning(
+                    "DAgger corrections-only mode defers video encoding until post-hardware finalize"
+                )
+                self.dataset.video_encoding_batch_size = minimum_batch_size
+
         # --- Policy loading ---
         if self.robot is None:
             raise ValueError("--robot.type is required for rollout")
+        if (
+            isinstance(self.strategy, DAggerStrategyConfig)
+            and self.strategy.record_autonomous
+            and getattr(self.robot, "type", None) in {"openarm_follower", "bi_openarm_follower"}
+        ):
+            raise ValueError(
+                "OpenArm DAgger requires record_autonomous=False because continuous mode still "
+                "persists episodes synchronously inside the hardware control loop"
+            )
 
         policy_path = parser.get_path_arg("policy")
         if policy_path:

@@ -95,6 +95,16 @@ def test_signal_handler_sets_event(use_threads, sig):
     assert handler.counter == 1
 
 
+def test_signal_handler_can_raise_on_first_signal_after_setting_event():
+    handler = ProcessSignalHandler(use_threads=True, raise_on_first_signal=True)
+
+    with pytest.raises(KeyboardInterrupt):
+        os.kill(os.getpid(), signal.SIGINT)
+
+    assert handler.shutdown_event.is_set()
+    assert handler.counter == 1
+
+
 @pytest.mark.parametrize("use_threads", [True, False])
 @patch("sys.exit")
 def test_force_shutdown_on_second_signal(mock_sys_exit, use_threads):

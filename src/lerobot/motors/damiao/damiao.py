@@ -197,9 +197,30 @@ class DamiaoMotorsBus(MotorsBusBase):
                 self._handshake()
 
             logger.debug(f"{self.__class__.__name__} connected via {self.can_interface}.")
-        except Exception as e:
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
+            if self.canbus is not None:
+                try:
+                    self.disable_torque(num_retry=2, require_response=True)
+                except BaseException as disable_error:
+                    cleanup_errors.append(disable_error)
+                    logger.exception("Failed to verify torque disable after CAN connection error")
+                try:
+                    self.canbus.shutdown()
+                except BaseException as shutdown_error:
+                    cleanup_errors.append(shutdown_error)
+                    logger.exception("Failed to close CAN bus after connection error")
+                finally:
+                    self.canbus = None
             self._is_connected = False
-            raise ConnectionError(f"Failed to connect to CAN bus: {e}") from e
+            if isinstance(error, Exception):
+                wrapped = ConnectionError(f"Failed to connect to CAN bus: {error}")
+                for cleanup_error in cleanup_errors:
+                    wrapped.add_note(f"Additional CAN cleanup error: {cleanup_error!r}")
+                raise wrapped from error
+            for cleanup_error in cleanup_errors:
+                error.add_note(f"Additional CAN cleanup error: {cleanup_error!r}")
+            raise
 
     def _handshake(self) -> None:
         """
@@ -234,10 +255,8 @@ class DamiaoMotorsBus(MotorsBusBase):
                     break
                 response = None
 
-            if response is None:
+            if response is None or not self._process_response(motor_name, response):
                 missing_motors.append(motor_name)
-            else:
-                self._process_response(motor_name, msg)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
         if missing_motors:
@@ -276,7 +295,9 @@ class DamiaoMotorsBus(MotorsBusBase):
             self._send_simple_command(motor, CAN_CMD_ENABLE)
             time.sleep(MEDIUM_TIMEOUT_SEC)
 
-    def _send_simple_command(self, motor: NameOrID, command_byte: int) -> None:
+    def _send_simple_command(
+        self, motor: NameOrID, command_byte: int, *, require_response: bool = False
+    ) -> None:
         """Helper to send simple 8-byte commands (Enable, Disable, Zero)."""
         motor_id = self._get_motor_id(motor)
         motor_name = self._get_motor_name(motor)
@@ -287,37 +308,108 @@ class DamiaoMotorsBus(MotorsBusBase):
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
+        drain_error: RuntimeError | None = None
+        if require_response:
+            try:
+                self._drain_receive_queue()
+            except RuntimeError as error:
+                if command_byte != CAN_CMD_DISABLE:
+                    raise
+                drain_error = error
         self.canbus.send(msg)
-        if msg := self._recv_motor_response(expected_recv_id=recv_id):
-            self._process_response(motor_name, msg)
+        if drain_error is not None:
+            raise RuntimeError(
+                f"Disable command was sent to {motor_name}, but its response cannot be "
+                "verified because the CAN receive queue could not be drained"
+            ) from drain_error
+        if msg := self._recv_motor_response(
+            expected_recv_id=recv_id,
+            timeout=MEDIUM_TIMEOUT_SEC if require_response else SHORT_TIMEOUT_SEC,
+        ):
+            if self._process_response(motor_name, msg):
+                return
+            message = f"Invalid response from {motor_name} after command 0x{command_byte:02X}"
         else:
-            logger.debug(f"No response from {motor_name} after command 0x{command_byte:02X}")
+            message = f"No response from {motor_name} after command 0x{command_byte:02X}"
+        if require_response:
+            raise RuntimeError(message)
+        logger.debug(message)
 
-    def enable_torque(self, motors: str | list[str] | None = None, num_retry: int = 0) -> None:
+    def enable_torque(
+        self,
+        motors: str | list[str] | None = None,
+        num_retry: int = 0,
+        *,
+        require_response: bool = False,
+    ) -> None:
         """Enable torque on selected motors."""
         target_motors = self._get_motors_list(motors)
         for motor in target_motors:
             for _ in range(num_retry + 1):
                 try:
-                    self._send_simple_command(motor, CAN_CMD_ENABLE)
+                    self._send_simple_command(motor, CAN_CMD_ENABLE, require_response=require_response)
                     break
                 except Exception as e:
                     if _ == num_retry:
                         raise e
                     time.sleep(MEDIUM_TIMEOUT_SEC)
 
-    def disable_torque(self, motors: str | list[str] | None = None, num_retry: int = 0) -> None:
-        """Disable torque on selected motors."""
+    def disable_torque(
+        self,
+        motors: str | list[str] | None = None,
+        num_retry: int = 0,
+        *,
+        require_response: bool = False,
+    ) -> None:
+        """Disable every selected motor before propagating any failure or signal."""
         target_motors = self._get_motors_list(motors)
+        failures: list[tuple[str, BaseException]] = []
+        interruptions: list[tuple[str, BaseException]] = []
         for motor in target_motors:
-            for _ in range(num_retry + 1):
+            last_error: BaseException | None = None
+            for attempt in range(num_retry + 1):
                 try:
-                    self._send_simple_command(motor, CAN_CMD_DISABLE)
-                    break
-                except Exception as e:
-                    if _ == num_retry:
-                        raise e
-                    time.sleep(MEDIUM_TIMEOUT_SEC)
+                    self._send_simple_command(motor, CAN_CMD_DISABLE, require_response=require_response)
+                except BaseException as error:
+                    last_error = error
+                    if not isinstance(error, Exception):
+                        # A first SIGINT must not prevent DISABLE commands from
+                        # reaching the remaining motors. Re-raise it only after
+                        # all targets have had their attempts.
+                        interruptions.append((motor, error))
+                    if attempt < num_retry:
+                        try:
+                            time.sleep(MEDIUM_TIMEOUT_SEC)
+                        except BaseException as sleep_error:
+                            last_error = sleep_error
+                            if not isinstance(sleep_error, Exception):
+                                interruptions.append((motor, sleep_error))
+                    continue
+                break
+            else:
+                assert last_error is not None
+                failures.append((motor, last_error))
+
+        if interruptions:
+            primary_motor, primary_error = interruptions[0]
+            primary_error.add_note(
+                f"Torque disable was interrupted while processing {primary_motor}; "
+                "all selected motors were still attempted"
+            )
+            for motor_name, cause in failures:
+                primary_error.add_note(f"{motor_name} disable failure: {cause!r}")
+            for motor_name, cause in interruptions[1:]:
+                primary_error.add_note(f"Additional interruption at {motor_name}: {cause!r}")
+            raise primary_error
+
+        if failures:
+            failed_names = [motor for motor, _error in failures]
+            error = RuntimeError(
+                f"Failed to verify torque disable for motors after all attempts: {failed_names}"
+            )
+            for motor_name, cause in failures:
+                error.add_note(f"{motor_name}: {cause!r}")
+            raise error from failures[0][1]
 
     @contextmanager
     def torque_disabled(self, motors: str | list[str] | None = None):
@@ -426,6 +518,15 @@ class DamiaoMotorsBus(MotorsBusBase):
 
         return responses
 
+    def _drain_receive_queue(self, max_messages: int = 512) -> None:
+        """Discard queued CAN frames before a strict command/response exchange."""
+        if self.canbus is None:
+            raise RuntimeError("CAN bus is not initialized.")
+        for _ in range(max_messages):
+            if self.canbus.recv(timeout=0.0) is None:
+                return
+        raise RuntimeError(f"CAN receive queue is still non-empty after draining {max_messages} messages")
+
     def _encode_mit_packet(
         self,
         motor_type: MotorType,
@@ -492,6 +593,8 @@ class DamiaoMotorsBus(MotorsBusBase):
     def _mit_control_batch(
         self,
         commands: dict[NameOrID, tuple[float, float, float, float, float]],
+        *,
+        require_response: bool = False,
     ) -> None:
         """
         Send MIT control commands to multiple motors in batch.
@@ -509,6 +612,9 @@ class DamiaoMotorsBus(MotorsBusBase):
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
 
+        if require_response:
+            self._drain_receive_queue()
+
         # Step 1: Send all MIT control commands
         for motor, (kp, kd, position_degrees, velocity_deg_per_sec, torque) in commands.items():
             motor_id = self._get_motor_id(motor)
@@ -522,10 +628,17 @@ class DamiaoMotorsBus(MotorsBusBase):
             recv_id_to_motor[self._get_motor_recv_id(motor)] = motor_name
 
         # Step 2: Collect responses and update state cache
-        responses = self._recv_all_responses(list(recv_id_to_motor.keys()), timeout=SHORT_TIMEOUT_SEC)
+        responses = self._recv_all_responses(
+            list(recv_id_to_motor.keys()),
+            timeout=MEDIUM_TIMEOUT_SEC if require_response else SHORT_TIMEOUT_SEC,
+        )
+        missing_motors: list[str] = []
         for recv_id, motor_name in recv_id_to_motor.items():
-            if msg := responses.get(recv_id):
-                self._process_response(motor_name, msg)
+            if (msg := responses.get(recv_id)) and self._process_response(motor_name, msg):
+                continue
+            missing_motors.append(motor_name)
+        if require_response and missing_motors:
+            raise RuntimeError(f"Missing or invalid MIT control responses from motors: {missing_motors}")
 
     def _float_to_uint(self, x: float, x_min: float, x_max: float, bits: int) -> int:
         """Convert float to unsigned integer for CAN transmission."""
@@ -567,7 +680,7 @@ class DamiaoMotorsBus(MotorsBusBase):
 
         return np.degrees(position_rad), np.degrees(velocity_rad_per_sec), torque, t_mos, t_rotor
 
-    def _process_response(self, motor: str, msg: can.Message) -> None:
+    def _process_response(self, motor: str, msg: can.Message) -> bool:
         """Decode a message and update the motor state cache."""
         try:
             motor_type = self._motor_types[motor]
@@ -580,8 +693,10 @@ class DamiaoMotorsBus(MotorsBusBase):
                 "temp_mos": float(t_mos),
                 "temp_rotor": float(t_rotor),
             }
+            return True
         except Exception as e:
             logger.warning(f"Failed to decode response from {motor}: {e}")
+            return False
 
     @check_if_not_connected
     def read(self, data_name: str, motor: str) -> Value:
@@ -657,6 +772,7 @@ class DamiaoMotorsBus(MotorsBusBase):
         motors: str | list[str] | None = None,
         *,
         num_retry: int = 0,
+        require_response: bool = False,
     ) -> dict[str, MotorState]:
         """
         Read ALL motor states (position, velocity, torque) from multiple motors in ONE refresh cycle.
@@ -666,18 +782,35 @@ class DamiaoMotorsBus(MotorsBusBase):
             Example: {'joint_1': {'position': 45.2, 'velocity': 1.3, 'torque': 0.5}, ...}
         """
         target_motors = self._get_motors_list(motors)
-        self._batch_refresh(target_motors)
+        pending_motors = target_motors
+        for attempt in range(num_retry + 1):
+            pending_motors = self._batch_refresh(
+                pending_motors,
+                drain_before_send=require_response,
+            )
+            if not pending_motors:
+                break
+            if attempt < num_retry:
+                time.sleep(MEDIUM_TIMEOUT_SEC)
+        if require_response and pending_motors:
+            raise RuntimeError(
+                "Missing or invalid fresh state responses from motors: "
+                f"{pending_motors} after {num_retry + 1} attempt(s)"
+            )
 
         result = {}
         for motor in target_motors:
             result[motor] = self._last_known_states[motor].copy()
         return result
 
-    def _batch_refresh(self, motors: list[str]) -> None:
-        """Internal helper to refresh a list of motors and update cache."""
+    def _batch_refresh(self, motors: list[str], *, drain_before_send: bool = False) -> list[str]:
+        """Refresh motors, update valid states, and return missing/invalid responders."""
 
         if self.canbus is None:
             raise RuntimeError("CAN bus is not initialized.")
+
+        if drain_before_send:
+            self._drain_receive_queue()
 
         # Send refresh commands
         for motor in motors:
@@ -693,13 +826,15 @@ class DamiaoMotorsBus(MotorsBusBase):
         responses = self._recv_all_responses(expected_recv_ids, timeout=MEDIUM_TIMEOUT_SEC)
 
         # Update cache
+        missing_motors: list[str] = []
         for motor in motors:
             recv_id = self._get_motor_recv_id(motor)
             msg = responses.get(recv_id)
-            if msg:
-                self._process_response(motor, msg)
-            else:
-                logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}). Using last known state.")
+            if msg and self._process_response(motor, msg):
+                continue
+            missing_motors.append(motor)
+            logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}). Using last known state.")
+        return missing_motors
 
     @check_if_not_connected
     def sync_write(self, data_name: str, values: dict[str, Value]) -> None:

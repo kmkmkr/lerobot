@@ -16,7 +16,7 @@
 
 from typing import Any
 
-from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.decorators import check_if_already_connected
 
 
 class BimanualMixin:
@@ -36,9 +36,33 @@ class BimanualMixin:
     left_arm: Any
     right_arm: Any
 
+    @staticmethod
+    def _arm_has_live_connection(arm: Any) -> bool:
+        """Detect partially connected arms, including a live CAN bus with a failed camera."""
+        try:
+            if bool(arm.is_connected):
+                return True
+        except Exception:
+            pass
+        bus = getattr(arm, "bus", None)
+        try:
+            if bus is not None and bool(bus.is_connected):
+                return True
+        except Exception:
+            pass
+        cameras = getattr(arm, "cameras", {})
+        try:
+            return any(bool(camera.is_connected) for camera in cameras.values())
+        except Exception:
+            return False
+
     @property
     def is_connected(self) -> bool:
         return self.left_arm.is_connected and self.right_arm.is_connected
+
+    @property
+    def any_arm_connected(self) -> bool:
+        return self._arm_has_live_connection(self.left_arm) or self._arm_has_live_connection(self.right_arm)
 
     @property
     def is_calibrated(self) -> bool:
@@ -57,7 +81,19 @@ class BimanualMixin:
         self.left_arm.configure()
         self.right_arm.configure()
 
-    @check_if_not_connected
     def disconnect(self) -> None:
-        self.left_arm.disconnect()
-        self.right_arm.disconnect()
+        errors: list[BaseException] = []
+        for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
+            if not self._arm_has_live_connection(arm):
+                continue
+            try:
+                arm.disconnect()
+            except BaseException as error:
+                error.add_note(f"Failed while disconnecting {side} arm")
+                errors.append(error)
+
+        if errors:
+            first_error = errors[0]
+            for additional_error in errors[1:]:
+                first_error.add_note(f"Additional bimanual disconnect error: {additional_error!r}")
+            raise first_error

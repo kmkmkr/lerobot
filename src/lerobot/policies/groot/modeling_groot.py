@@ -40,7 +40,7 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 from ..pretrained import PreTrainedPolicy
-from ..utils import get_device_from_parameters
+from ..utils import get_device_from_parameters, log_model_loading_keys
 from .configuration_groot import (
     GROOT_N1_5,
     GROOT_N1_5_REMOVAL_GUIDANCE,
@@ -60,6 +60,11 @@ else:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="GrootPolicy")
+
+_QWEN_TIED_WEIGHT_KEYS = (
+    "_groot_model.backbone.model.lm_head.weight",
+    "_groot_model.backbone.model.model.language_model.embed_tokens.weight",
+)
 
 
 class GrootPolicy(PreTrainedPolicy):
@@ -148,6 +153,90 @@ class GrootPolicy(PreTrainedPolicy):
     def reset(self):
         """Reset policy state when environment resets."""
         self._action_queue = deque([], maxlen=self._action_queue_steps)
+
+    @staticmethod
+    def _has_equivalent_serialized_qwen_tied_weights(model: torch.nn.Module, model_file: str) -> bool:
+        """Detect FSDP checkpoints that materialized both sides of Qwen's weight tie."""
+        model_state = model.state_dict()
+        if not all(key in model_state for key in _QWEN_TIED_WEIGHT_KEYS):
+            return False
+
+        lm_head, embed_tokens = (model_state[key] for key in _QWEN_TIED_WEIGHT_KEYS)
+        if lm_head.data_ptr() != embed_tokens.data_ptr():
+            return False
+
+        from safetensors import safe_open
+
+        with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+            checkpoint_keys = set(checkpoint.keys())
+            if not all(key in checkpoint_keys for key in _QWEN_TIED_WEIGHT_KEYS):
+                return False
+
+            lm_head_slice, embed_tokens_slice = (checkpoint.get_slice(key) for key in _QWEN_TIED_WEIGHT_KEYS)
+            if (
+                lm_head_slice.get_shape() != embed_tokens_slice.get_shape()
+                or lm_head_slice.get_dtype() != embed_tokens_slice.get_dtype()
+            ):
+                raise RuntimeError(
+                    "The serialized Qwen lm_head and input-embedding weights have incompatible metadata."
+                )
+
+            # Compare in bounded chunks: the N1.7 vocabulary matrix is about 1.2 GB in FP32.
+            num_rows = lm_head_slice.get_shape()[0]
+            for start in range(0, num_rows, 4096):
+                stop = min(start + 4096, num_rows)
+                if not torch.equal(lm_head_slice[start:stop], embed_tokens_slice[start:stop]):
+                    raise RuntimeError(
+                        "The serialized Qwen lm_head and input-embedding weights should be tied, "
+                        "but their values differ. Refusing to choose one during strict loading."
+                    )
+
+        return True
+
+    @classmethod
+    def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
+        """Strictly load GR00T while accepting an equivalent duplicated Qwen tied weight.
+
+        FSDP full-state-dict gathering materializes tied parameters as independent tensors. Older
+        checkpoints can therefore contain both ``lm_head.weight`` and ``embed_tokens.weight`` even
+        though the reconstructed model ties them again. ``safetensors.load_model(strict=True)``
+        reports one copy as unexpected. Only suppress that bookkeeping mismatch after verifying
+        that the model tensors are tied and both serialized copies are exactly equal.
+        """
+        if not strict or not cls._has_equivalent_serialized_qwen_tied_weights(model, model_file):
+            return super()._load_as_safetensor(model, model_file, map_location, strict)
+
+        import packaging
+        import safetensors
+        from safetensors.torch import load_model as load_model_as_safetensor
+
+        load_kwargs = {"strict": False}
+        if packaging.version.parse(safetensors.__version__) >= packaging.version.parse("0.4.3"):
+            load_kwargs["device"] = map_location
+
+        missing_keys, unexpected_keys = load_model_as_safetensor(model, model_file, **load_kwargs)
+        ignored_keys = sorted(set(unexpected_keys).intersection(_QWEN_TIED_WEIGHT_KEYS))
+        unexpected_keys = [key for key in unexpected_keys if key not in ignored_keys]
+
+        if missing_keys or unexpected_keys:
+            error = f"Error(s) in loading state_dict for {model.__class__.__name__}:"
+            if missing_keys:
+                keys = ", ".join(f'"{key}"' for key in sorted(missing_keys))
+                error += f"\n    Missing key(s) in state_dict: {keys}"
+            if unexpected_keys:
+                keys = ", ".join(f'"{key}"' for key in sorted(unexpected_keys))
+                error += f"\n    Unexpected key(s) in state_dict: {keys}"
+            raise RuntimeError(error)
+
+        logger.warning(
+            "Accepted equivalent duplicated Qwen tied weight from an FSDP checkpoint: %s",
+            ignored_keys,
+        )
+        log_model_loading_keys(missing_keys, unexpected_keys)
+
+        if "device" not in load_kwargs and map_location != "cpu":
+            model.to(map_location)
+        return model
 
     @classmethod
     def from_pretrained(

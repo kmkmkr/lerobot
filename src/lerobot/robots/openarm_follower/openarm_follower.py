@@ -249,19 +249,26 @@ class OpenArmFollower(Robot):
         logger.info(f"Connecting arm on {self.config.port}...")
         self.bus.connect()
 
-        if calibrate:
-            logger.info(
-                "Using the existing OpenArm motor zero. LeRobot will not write or replace zero positions."
-            )
+        try:
+            if calibrate:
+                logger.info(
+                    "Using the existing OpenArm motor zero. LeRobot will not write or replace zero positions."
+                )
 
-        for cam in self.cameras.values():
-            cam.connect()
+            for cam in self.cameras.values():
+                cam.connect()
 
-        self.configure()
+            self.configure()
 
-        self.bus.enable_torque()
+            self.bus.enable_torque()
 
-        logger.info(f"{self} connected.")
+            logger.info(f"{self} connected.")
+        except BaseException as error:
+            try:
+                self._disconnect_components(disable_torque=True)
+            except BaseException as cleanup_error:
+                error.add_note(f"Additional OpenArm connection cleanup error: {cleanup_error!r}")
+            raise
 
     @property
     def is_calibrated(self) -> bool:
@@ -288,9 +295,9 @@ class OpenArmFollower(Robot):
         )
 
     @check_if_not_connected
-    def get_motor_positions(self) -> dict[str, float]:
+    def get_motor_positions(self, *, require_response: bool = False) -> dict[str, float]:
         """Read motor-zero positions without touching any configured cameras."""
-        states = self._read_motor_states()
+        states = self._read_motor_states(require_response=require_response)
         return {motor: float(states[motor]["position"]) for motor in self.bus.motors}
 
     def trajectory_position_gains(self) -> tuple[dict[str, float], dict[str, float]]:
@@ -347,8 +354,11 @@ class OpenArmFollower(Robot):
 
         return obs_dict
 
-    def _read_motor_states(self) -> dict[str, dict[str, float]]:
-        states = self.bus.sync_read_all_states()
+    def _read_motor_states(self, *, require_response: bool = False) -> dict[str, dict[str, float]]:
+        if require_response:
+            states = self.bus.sync_read_all_states(num_retry=2, require_response=True)
+        else:
+            states = self.bus.sync_read_all_states()
         self._latest_motor_states = {
             motor: {key: float(value) for key, value in state.items()} for motor, state in states.items()
         }
@@ -408,7 +418,9 @@ class OpenArmFollower(Robot):
         custom_kp: dict[str, float] | None = None,
         custom_kd: dict[str, float] | None = None,
         *,
+        apply_joint_limits: bool = True,
         apply_max_relative_target: bool = True,
+        require_response: bool = False,
     ) -> RobotAction:
         """
         Send action command to robot.
@@ -419,6 +431,9 @@ class OpenArmFollower(Robot):
             action: Dictionary with motor positions (e.g., "joint_1.pos", "joint_2.pos")
             custom_kp: Optional custom kp gains per motor (e.g., {"joint_1": 120.0, "joint_2": 150.0})
             custom_kd: Optional custom kd gains per motor (e.g., {"joint_1": 1.5, "joint_2": 2.0})
+            apply_joint_limits: Clip targets to the configured policy/deployment
+                limits. Fault handling may disable this only after independently
+                validating a fresh measured pose against physical limits.
             apply_max_relative_target: Apply the policy-action relative target
                 limiter. Validated deployment trajectories disable this because
                 they have their own joint, velocity, clipping, and tracking
@@ -429,17 +444,18 @@ class OpenArmFollower(Robot):
         """
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+        goal_vel = {key.removesuffix(".vel"): val for key, val in action.items() if key.endswith(".vel")}
 
-        # Apply joint limit clipping to arm
-        joint_limits = self.config.joint_limits
-        assert joint_limits is not None
-        for motor_name, position in goal_pos.items():
-            if motor_name in joint_limits:
-                min_limit, max_limit = joint_limits[motor_name]
-                clipped_position = max(min_limit, min(max_limit, position))
-                if clipped_position != position:
-                    logger.debug(f"Clipped {motor_name} from {position:.2f}° to {clipped_position:.2f}°")
-                goal_pos[motor_name] = clipped_position
+        if apply_joint_limits:
+            joint_limits = self.config.joint_limits
+            assert joint_limits is not None
+            for motor_name, position in goal_pos.items():
+                if motor_name in joint_limits:
+                    min_limit, max_limit = joint_limits[motor_name]
+                    clipped_position = max(min_limit, min(max_limit, position))
+                    if clipped_position != position:
+                        logger.debug(f"Clipped {motor_name} from {position:.2f}° to {clipped_position:.2f}°")
+                    goal_pos[motor_name] = clipped_position
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
@@ -484,21 +500,70 @@ class OpenArmFollower(Robot):
                     if isinstance(self.config.position_kd, list)
                     else self.config.position_kd
                 )
-            commands[motor_name] = (kp, kd, position_degrees, 0.0, compensation_torques[motor_name])
+            target_velocity = float(goal_vel.get(motor_name, 0.0))
+            motor_type_name = self.config.motor_config[motor_name][2].upper().replace("-", "_")
+            motor_type = getattr(MotorType, motor_type_name)
+            velocity_limit_deg_s = math.degrees(MOTOR_LIMIT_PARAMS[motor_type][1])
+            if not math.isfinite(target_velocity) or not (
+                -velocity_limit_deg_s <= target_velocity <= velocity_limit_deg_s
+            ):
+                raise ValueError(
+                    f"OpenArm target velocity is outside the {motor_name} MIT range: "
+                    f"value={target_velocity} "
+                    f"allowed=[{-velocity_limit_deg_s}, {velocity_limit_deg_s}] deg/s"
+                )
+            commands[motor_name] = (
+                kp,
+                kd,
+                position_degrees,
+                target_velocity,
+                compensation_torques[motor_name],
+            )
 
-        self.bus._mit_control_batch(commands)
+        if require_response:
+            self.bus._mit_control_batch(commands, require_response=True)
+        else:
+            self.bus._mit_control_batch(commands)
 
-        return {f"{motor}.pos": val for motor, val in goal_pos.items()}
+        sent_action = {f"{motor}.pos": val for motor, val in goal_pos.items()}
+        sent_action.update(
+            {f"{motor}.vel": float(goal_vel[motor]) for motor in goal_pos if motor in goal_vel}
+        )
+        return sent_action
 
-    @check_if_not_connected
-    def disconnect(self):
-        """Disconnect from robot."""
+    def _disconnect_components(self, *, disable_torque: bool) -> None:
+        """Disconnect live components, optionally requiring verified torque disable."""
+        errors: list[BaseException] = []
+        if self.bus.is_connected:
+            if disable_torque:
+                try:
+                    self.bus.disable_torque(num_retry=2, require_response=True)
+                except BaseException as error:
+                    error.add_note("Failed to verify OpenArm torque disable before CAN close")
+                    errors.append(error)
+            try:
+                # Torque handling above is strict. Always close the socket even when a motor ACK is missing.
+                self.bus.disconnect(False)
+            except BaseException as error:
+                error.add_note("Failed while closing the OpenArm CAN bus")
+                errors.append(error)
 
-        # Disconnect CAN bus
-        self.bus.disconnect(self.config.disable_torque_on_disconnect)
-
-        # Disconnect cameras
-        for cam in self.cameras.values():
-            cam.disconnect()
+        for name, camera in self.cameras.items():
+            if not camera.is_connected:
+                continue
+            try:
+                camera.disconnect()
+            except BaseException as error:
+                error.add_note(f"Failed while disconnecting OpenArm camera {name!r}")
+                errors.append(error)
 
         logger.info(f"{self} disconnected.")
+        if errors:
+            first_error = errors[0]
+            for additional_error in errors[1:]:
+                first_error.add_note(f"Additional OpenArm disconnect error: {additional_error!r}")
+            raise first_error
+
+    def disconnect(self) -> None:
+        """Disconnect every live component, including a CAN-only partial connection."""
+        self._disconnect_components(disable_torque=self.config.disable_torque_on_disconnect)

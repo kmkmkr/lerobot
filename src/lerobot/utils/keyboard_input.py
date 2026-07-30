@@ -112,7 +112,8 @@ def pynput_can_capture() -> bool:
     between the ``pynput`` backend and a fallback. It is intentionally
     conservative:
 
-    * Linux: only a real X11 session (a display is present *and* it is not Wayland).
+    * Linux: only a real X11 session with the RECORD extension (a display is
+      present, it is not Wayland, and python-xlib exposes the capture API).
     * macOS: ``True`` here — Accessibility / Input-Monitoring permission
       (``IS_TRUSTED``) can only be confirmed at runtime *after* starting a
       listener, so :func:`init_keyboard_listener` refines this with
@@ -124,8 +125,47 @@ def pynput_can_capture() -> bool:
     if not _pynput_available:
         return False
     if platform.system() == "Linux":
-        return not is_headless() and not is_wayland()
+        if is_headless() or is_wayland():
+            return False
+        if not _x11_record_available():
+            logger.warning("pynput disabled: the active X11 server has no usable RECORD extension.")
+            return False
     return True
+
+
+def _x11_record_available() -> bool:
+    """Return whether the active Linux X server exposes pynput's RECORD API.
+
+    A reachable ``DISPLAY`` is not sufficient for global keyboard capture. In
+    particular, X servers/proxies used from containers may omit the RECORD
+    extension; ``pynput`` then starts a thread which immediately dies while
+    looking up ``record_create_context``. Probe both the server extension and
+    the python-xlib method before treating the backend as usable.
+    """
+    if platform.system() != "Linux":
+        return True
+
+    display = None
+    try:
+        from Xlib import display as xdisplay
+        from Xlib.ext import record
+
+        display = xdisplay.Display()
+        if not display.has_extension("RECORD"):
+            return False
+        extension = display.query_extension("RECORD")
+        if not getattr(extension, "present", False):
+            return False
+        if not callable(getattr(display, "record_create_context", None)):
+            record.init(display, extension)
+        return callable(getattr(display, "record_create_context", None))
+    except Exception as error:
+        logger.debug("X11 RECORD preflight failed: %s", error)
+        return False
+    finally:
+        if display is not None:
+            with contextlib.suppress(Exception):
+                display.close()
 
 
 def pynput_listener_is_trusted(listener, timeout_s: float = 1.0) -> bool:
@@ -306,6 +346,29 @@ class TerminalKeyListener:
         with contextlib.suppress(Exception):
             atexit.unregister(self.stop)
 
+    def is_alive(self) -> bool:
+        """Return whether the terminal reader thread is actively running."""
+        thread = self._thread
+        return self._running and thread is not None and thread.is_alive()
+
+
+def key_listener_is_alive(listener) -> bool:
+    """Best-effort liveness check shared by terminal and pynput listeners.
+
+    Unknown listener implementations are treated as alive for compatibility;
+    listeners exposing an ``is_alive()`` probe must positively report liveness.
+    """
+    if listener is None:
+        return False
+    is_alive = getattr(listener, "is_alive", None)
+    if callable(is_alive):
+        try:
+            return bool(is_alive())
+        except Exception:
+            return False
+    running = getattr(listener, "running", None)
+    return True if running is None else bool(running)
+
 
 # Map pynput key objects to the same canonical names TerminalKeyListener emits, so a
 # single dispatch works across both backends. Empty when pynput is unavailable.
@@ -338,11 +401,17 @@ def _resolve_pynput_key(key) -> str | None:
     return getattr(key, "char", None) or None
 
 
-def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str = ""):
+def create_key_listener(
+    dispatch: Callable[[str], None],
+    *,
+    controls_help: str = "",
+    prefer_terminal: bool = False,
+):
     """Start a keyboard listener that routes resolved key names to ``dispatch``.
 
     Shared backend selection used by recording and the rollout strategies:
 
+    * the terminal listener first when ``prefer_terminal=True`` and a POSIX TTY is available;
     * the ``pynput`` global listener on X11 / trusted-macOS / Windows (on macOS the
       listener's ``IS_TRUSTED`` flag is checked after start, and an untrusted listener is
       stopped so the terminal backend is used instead);
@@ -354,11 +423,26 @@ def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str =
     ``dispatch`` works regardless of backend. ``controls_help`` is an optional hint
     appended to the log messages.
 
+    ``prefer_terminal`` is intended for safety-sensitive command-line controls such as
+    DAgger: key capture stays scoped to the focused controlling terminal and does not
+    depend on optional X11 extensions forwarded into a container.
+
     Returns the listener (exposing ``.stop()``) or ``None``.
     """
     suffix = f" ({controls_help})" if controls_help else ""
 
-    if pynput_can_capture() and keyboard is not None:
+    def start_terminal_listener():
+        listener = TerminalKeyListener(dispatch)
+        listener.start()
+        logger.info("Using terminal keyboard input — keep this terminal focused%s.", suffix)
+        return listener
+
+    terminal_available = _TERMIOS_AVAILABLE and sys.stdin.isatty()
+    if prefer_terminal and terminal_available:
+        return start_terminal_listener()
+
+    use_pynput = pynput_can_capture() and keyboard is not None
+    if use_pynput:
 
         def on_press(key):
             with contextlib.suppress(Exception):
@@ -366,28 +450,30 @@ def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str =
                 if name is not None:
                     dispatch(name)
 
-        listener = keyboard.Listener(on_press=on_press)
-        listener.start()
-        if pynput_listener_is_trusted(listener):
-            logger.info("Keyboard listener started%s.", suffix)
-            return listener
-        # macOS without Accessibility / Input-Monitoring permission: the listener never
-        # fires. Stop it and fall through to the terminal backend.
-        logger.warning(
-            "pynput keyboard listener is not trusted (missing macOS Accessibility / "
-            "Input Monitoring permission); falling back to terminal keyboard input."
-        )
-        listener.stop()
+        listener = None
+        try:
+            listener = keyboard.Listener(on_press=on_press)
+            listener.start()
+        except Exception as error:
+            logger.warning("pynput keyboard listener failed to start (%s); using terminal fallback.", error)
+        else:
+            if pynput_listener_is_trusted(listener) and key_listener_is_alive(listener):
+                logger.info("Using pynput keyboard input%s.", suffix)
+                return listener
+            logger.warning("pynput keyboard listener is unavailable; using terminal fallback%s.", suffix)
 
-    if sys.stdin.isatty():
-        listener = TerminalKeyListener(dispatch)
-        listener.start()
-        logger.info("Using terminal keyboard input — keep this terminal focused%s.", suffix)
-        return listener
+        # A failed pynput thread can block forever in stop(). Only stop a listener
+        # that still positively reports liveness.
+        if listener is not None and key_listener_is_alive(listener):
+            with contextlib.suppress(Exception):
+                listener.stop()
+
+    if terminal_available:
+        return start_terminal_listener()
 
     logger.warning(
-        "Keyboard controls unavailable: no usable display (Wayland/headless) and stdin is "
-        "not an interactive terminal%s.",
+        "Keyboard controls unavailable: neither a usable pynput backend nor an interactive "
+        "POSIX terminal is available%s.",
         suffix,
     )
     return None

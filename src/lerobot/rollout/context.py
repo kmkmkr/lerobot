@@ -22,7 +22,10 @@ and :class:`DatasetContext` — assembled into :class:`RolloutContext`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import wraps
 from threading import Event
 
 import torch
@@ -109,6 +112,11 @@ class HardwareContext:
     robot_wrapper: ThreadSafeRobot
     teleop: Teleoperator | None
     initial_position: dict | None = None
+    # Set by a control loop before re-raising a hardware/control exception.
+    # Teardown uses it to prohibit automatic return motion.
+    control_fault: BaseException | None = None
+    # Makes emergency and ordinary teardown safely idempotent.
+    teardown_complete: bool = False
 
 
 @dataclass
@@ -158,6 +166,67 @@ class RolloutContext:
 # Build
 # ---------------------------------------------------------------------------
 
+_pending_context_hardware: ContextVar[tuple[object, Teleoperator | None] | None] = ContextVar(
+    "pending_rollout_context_hardware", default=None
+)
+
+
+def _cleanup_connected_hardware_on_build_error(func):
+    """Disconnect hardware if context assembly fails after connection."""
+
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        token = _pending_context_hardware.set(None)
+        try:
+            return func(*args, **kwargs)
+        except BaseException:
+            pending = _pending_context_hardware.get()
+            if pending is not None:
+                robot, teleop = pending
+                logger.critical(
+                    "Rollout context construction failed after hardware connection; "
+                    "prohibiting startup/return motion and securing in place"
+                )
+                secure = getattr(robot, "secure_intervention_after_fault", None)
+                if teleop is not None and callable(secure):
+                    try:
+                        secure(teleop)
+                    except BaseException:
+                        logger.exception("Failed to secure OpenArm hardware after context build error")
+                _disconnect_after_hardware_setup_error(robot, teleop)
+            raise
+        finally:
+            _pending_context_hardware.reset(token)
+
+    return wrapped
+
+
+def _device_has_live_connection(device) -> bool:
+    """Detect complete or partial hardware connections during startup cleanup."""
+    any_arm_connected = getattr(type(device), "any_arm_connected", None)
+    if isinstance(any_arm_connected, property):
+        try:
+            if bool(device.any_arm_connected):
+                return True
+        except Exception:
+            pass
+    try:
+        if bool(device.is_connected):
+            return True
+    except Exception:
+        pass
+    bus = getattr(device, "bus", None)
+    try:
+        if bus is not None and bool(bus.is_connected):
+            return True
+    except Exception:
+        pass
+    cameras = getattr(device, "cameras", {})
+    try:
+        return any(bool(camera.is_connected) for camera in cameras.values())
+    except Exception:
+        return False
+
 
 def _disconnect_after_hardware_setup_error(robot, teleop: Teleoperator | None) -> None:
     """Best-effort cleanup for failures before a RolloutContext exists."""
@@ -165,10 +234,10 @@ def _disconnect_after_hardware_setup_error(robot, teleop: Teleoperator | None) -
         if device is None:
             continue
         try:
-            if device.is_connected:
+            if _device_has_live_connection(device):
                 logger.info("Disconnecting %s after rollout hardware setup error", label)
                 device.disconnect()
-        except Exception:
+        except BaseException:
             logger.exception("Failed to disconnect %s after rollout hardware setup error", label)
 
 
@@ -183,6 +252,8 @@ def _connect_rollout_hardware(cfg: RolloutConfig):
     logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
     robot = make_robot_from_config(cfg.robot)
     teleop = None
+    intervention_ready = False
+    _pending_context_hardware.set((robot, teleop))
     try:
         robot.connect()
         logger.info("Robot connected: %s", robot.name)
@@ -195,9 +266,11 @@ def _connect_rollout_hardware(cfg: RolloutConfig):
         if coordinated_intervention:
             logger.info("Connecting teleoperator before coordinated intervention startup motion...")
             teleop = make_teleoperator_from_config(cfg.teleop)
+            _pending_context_hardware.set((robot, teleop))
             teleop.connect()
             logger.info("Teleoperator connected")
             intervention_prepare(teleop)
+            intervention_ready = True
         else:
             prepare_for_policy_deployment = getattr(robot, "prepare_for_policy_deployment", None)
             if callable(prepare_for_policy_deployment):
@@ -206,6 +279,7 @@ def _connect_rollout_hardware(cfg: RolloutConfig):
             if cfg.teleop is not None:
                 logger.info("Connecting teleoperator (%s)...", cfg.teleop.type)
                 teleop = make_teleoperator_from_config(cfg.teleop)
+                _pending_context_hardware.set((robot, teleop))
                 teleop.connect()
                 logger.info("Teleoperator connected")
 
@@ -214,20 +288,30 @@ def _connect_rollout_hardware(cfg: RolloutConfig):
         initial_obs = robot.get_observation()
         initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
         logger.info("Captured initial robot position (%d keys)", len(initial_position))
-    except Exception:
+    except BaseException:
         logger.exception("Rollout hardware setup or startup motion failed")
+        if intervention_ready and teleop is not None:
+            secure = getattr(robot, "secure_intervention_after_fault", None)
+            if callable(secure):
+                try:
+                    secure(teleop)
+                except BaseException:
+                    logger.exception("Failed to secure task-ready OpenArm hardware after observation error")
         _disconnect_after_hardware_setup_error(robot, teleop)
+        _pending_context_hardware.set(None)
         raise
 
     return robot, ThreadSafeRobot(robot), teleop, initial_position
 
 
+@_cleanup_connected_hardware_on_build_error
 def build_rollout_context(
     cfg: RolloutConfig,
     shutdown_event: Event,
     teleop_action_processor: RobotProcessorPipeline | None = None,
     robot_action_processor: RobotProcessorPipeline | None = None,
     robot_observation_processor: RobotProcessorPipeline | None = None,
+    context_ready_callback: Callable[[RolloutContext], None] | None = None,
 ) -> RolloutContext:
     """Wire up policy, processors, hardware, dataset, and inference engine.
 
@@ -297,6 +381,7 @@ def build_rollout_context(
 
     # --- 3. Hardware (heaviest side-effect, deferred) -----------------
     robot, robot_wrapper, teleop, initial_position = _connect_rollout_hardware(cfg)
+    _pending_context_hardware.set((robot, teleop))
 
     # --- 4. Features + action-key reconciliation ---------------------
     # TODO(Steven):Only ``.pos`` joint features are routed to the policy as state and as the
@@ -463,7 +548,7 @@ def build_rollout_context(
 
     # --- 8. Assemble ---------------------------------------------------
     logger.info("Rollout context assembled successfully")
-    return RolloutContext(
+    context = RolloutContext(
         runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
         hardware=HardwareContext(
             robot_wrapper=robot_wrapper, teleop=teleop, initial_position=initial_position
@@ -486,3 +571,8 @@ def build_rollout_context(
             ordered_action_keys=ordered_action_keys,
         ),
     )
+    # Publish ownership before returning so the caller can still tear down
+    # hardware if a signal lands in the CALL -> STORE_FAST bytecode gap.
+    if context_ready_callback is not None:
+        context_ready_callback(context)
+    return context

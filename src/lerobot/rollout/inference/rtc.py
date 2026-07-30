@@ -121,7 +121,12 @@ class RTCInferenceEngine(InferenceEngine):
 
         self._action_queue: ActionQueue | None = None
         self._obs_holder: dict[str, Any] = {}
+        # Protects lifecycle generation, observation validity, and queue commits.
         self._obs_lock = Lock()
+        self._inference_lock = Lock()
+        self._reset_lock = Lock()
+        self._generation = 0
+        self._resetting = False
         self._policy_active = Event()
         self._compile_warmup_done = Event()
         self._shutdown_event = Event()
@@ -179,12 +184,18 @@ class RTCInferenceEngine(InferenceEngine):
 
     def start(self) -> None:
         """Launch the RTC background thread."""
-        self._action_queue = ActionQueue(self._rtc_config)
-        self._obs_holder = {
-            "obs": None,
-            "robot_type": self._robot.robot_type,
-        }
+        with self._obs_lock:
+            self._policy_active.clear()
+            self._generation += 1
+            self._resetting = False
+            self._action_queue = ActionQueue(self._rtc_config)
+            self._obs_holder = {
+                "obs": None,
+                "generation": None,
+                "robot_type": self._robot.robot_type,
+            }
         self._shutdown_event.clear()
+        self._rtc_error.clear()
         self._rtc_thread = Thread(
             target=self._rtc_loop,
             daemon=True,
@@ -196,8 +207,12 @@ class RTCInferenceEngine(InferenceEngine):
     def stop(self) -> None:
         """Signal the RTC thread to stop and wait for it."""
         logger.info("Stopping RTC inference thread...")
-        self._shutdown_event.set()
-        self._policy_active.clear()
+        with self._obs_lock:
+            self._shutdown_event.set()
+            self._policy_active.clear()
+            self._invalidate_observation_locked()
+            if self._action_queue is not None:
+                self._action_queue.clear()
         if self._rtc_thread is not None and self._rtc_thread.is_alive():
             self._rtc_thread.join(timeout=_RTC_JOIN_TIMEOUT_S)
             if self._rtc_thread.is_alive():
@@ -209,21 +224,51 @@ class RTCInferenceEngine(InferenceEngine):
     def pause(self) -> None:
         """Pause the RTC background thread."""
         logger.info("Pausing RTC inference thread")
-        self._policy_active.clear()
+        with self._obs_lock:
+            self._policy_active.clear()
+            self._invalidate_observation_locked()
+            if self._action_queue is not None:
+                self._action_queue.clear()
 
     def resume(self) -> None:
-        """Resume the RTC background thread."""
+        """Resume inference after a fresh observation has been published.
+
+        Calling this before notify_observation is safe: the worker stays idle
+        until it receives an observation from the current lifecycle generation.
+        """
         logger.info("Resuming RTC inference thread")
-        self._policy_active.set()
+        with self._obs_lock:
+            self._policy_active.set()
 
     def reset(self) -> None:
         """Reset the policy, processors, and action queue."""
         logger.info("Resetting RTC inference state (policy + processors + queue)")
-        self._policy.reset()
-        self._preprocessor.reset()
-        self._postprocessor.reset()
-        if self._action_queue is not None:
-            self._action_queue.clear()
+        # Invalidate the generation before waiting for an in-flight inference.
+        # This guarantees that a result started before reset cannot commit.
+        with self._reset_lock:
+            with self._obs_lock:
+                self._resetting = True
+                self._invalidate_observation_locked()
+                if self._action_queue is not None:
+                    self._action_queue.clear()
+            try:
+                # Processor and policy reset must not race their inference calls.
+                with self._inference_lock:
+                    self._policy.reset()
+                    self._preprocessor.reset()
+                    self._postprocessor.reset()
+            finally:
+                with self._obs_lock:
+                    self._resetting = False
+
+    def _invalidate_observation_locked(self) -> None:
+        """Advance the lifecycle generation and invalidate the held observation.
+
+        The caller must hold the observation lock.
+        """
+        self._generation += 1
+        self._obs_holder["obs"] = None
+        self._obs_holder["generation"] = None
 
     # ------------------------------------------------------------------
     # Action production (called from main thread)
@@ -231,14 +276,17 @@ class RTCInferenceEngine(InferenceEngine):
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Pop the next action from the RTC queue (ignores ``obs_frame``)."""
-        if self._action_queue is None:
-            return None
-        return self._action_queue.get()
+        with self._obs_lock:
+            if self._action_queue is None or not self._policy_active.is_set() or self._resetting:
+                return None
+            queue = self._action_queue
+        return queue.get()
 
     def notify_observation(self, obs: dict) -> None:
         """Publish the latest observation for the RTC thread to consume."""
         with self._obs_lock:
             self._obs_holder["obs"] = obs
+            self._obs_holder["generation"] = self._generation
 
     # ------------------------------------------------------------------
     # RTC: background inference thread
@@ -254,43 +302,60 @@ class RTCInferenceEngine(InferenceEngine):
             warmup_required = max(1, self._compile_warmup_inferences) if self._use_torch_compile else 0
             inference_count = 0
             consecutive_errors = 0
+            latency_generation: int | None = None
 
             while not self._shutdown_event.is_set():
-                if not self._policy_active.is_set():
-                    time.sleep(_RTC_IDLE_SLEEP_S)
-                    continue
-
-                queue = self._action_queue
                 with self._obs_lock:
+                    queue = self._action_queue
                     obs = self._obs_holder.get("obs")
-                if queue is None or obs is None:
+                    generation = self._generation
+                    observation_generation = self._obs_holder.get("generation")
+                    can_infer = self._policy_active.is_set() and not self._resetting
+
+                if not can_infer or queue is None or obs is None or observation_generation != generation:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
-                if queue.qsize() <= self._rtc_queue_threshold:
+                if latency_generation != generation:
+                    latency_tracker.reset()
+                    latency_generation = generation
+
+                remaining, idx_before, prev_actions, prev_abs = queue.snapshot_for_inference()
+
+                if remaining <= self._rtc_queue_threshold:
                     try:
                         current_time = time.perf_counter()
-                        idx_before = queue.get_action_index()
-                        prev_actions = queue.get_left_over()
 
                         latency = latency_tracker.max()
-                        delay = math.ceil(latency / time_per_chunk) if latency else 0
+                        delay = min(math.ceil(latency / time_per_chunk), remaining) if latency else 0
+                        if remaining == 0:
+                            # No action can be consumed while this first chunk is inferred.
+                            prev_actions = None
+                            prev_abs = None
 
-                        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
-                        obs_batch = prepare_observation_for_inference(
-                            obs_batch, policy_device, self._task, self._robot.robot_type
-                        )
-                        obs_batch["task"] = [self._task]
+                        with self._inference_lock:
+                            with self._obs_lock:
+                                if (
+                                    generation != self._generation
+                                    or self._resetting
+                                    or not self._policy_active.is_set()
+                                    or queue is not self._action_queue
+                                ):
+                                    continue
 
-                        preprocessed = self._preprocessor(obs_batch)
+                            obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
+                            obs_batch = prepare_observation_for_inference(
+                                obs_batch, policy_device, self._task, self._robot.robot_type
+                            )
+                            obs_batch["task"] = [self._task]
 
-                        if prev_actions is not None and self._relative_step is not None:
-                            # Rebase against the raw cached state so the leftover tail stays in
-                            # the training-time coordinate frame.
-                            raw_state = self._relative_step.get_cached_state()
-                            if raw_state is not None:
-                                prev_abs = queue.get_processed_left_over()
-                                if prev_abs is not None and prev_abs.numel() > 0:
+                            preprocessed = self._preprocessor(obs_batch)
+
+                            if prev_actions is not None and self._relative_step is not None:
+                                # Rebase against the raw cached state so the leftover tail stays in
+                                # the training-time coordinate frame.
+                                raw_state = self._relative_step.get_cached_state()
+                                if raw_state is not None and prev_abs is not None and prev_abs.numel() > 0:
                                     prev_actions = reanchor_relative_rtc_prefix(
                                         prev_actions_absolute=prev_abs,
                                         current_state=raw_state,
@@ -299,17 +364,19 @@ class RTCInferenceEngine(InferenceEngine):
                                         policy_device=policy_device,
                                     )
 
-                        if prev_actions is not None:
-                            prev_actions = _normalize_prev_actions_length(
-                                prev_actions, target_steps=self._rtc_config.execution_horizon
+                            if prev_actions is not None:
+                                prev_actions = _normalize_prev_actions_length(
+                                    prev_actions, target_steps=self._rtc_config.execution_horizon
+                                )
+
+                            actions = self._policy.predict_action_chunk(
+                                preprocessed,
+                                inference_delay=delay,
+                                prev_chunk_left_over=prev_actions,
                             )
 
-                        actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
-                        )
-
-                        original = actions.squeeze(0).clone()
-                        processed = self._postprocessor(actions).squeeze(0)
+                            original = actions.squeeze(0).clone()
+                            processed = self._postprocessor(actions).squeeze(0)
                         new_latency = time.perf_counter() - current_time
                         new_delay = math.ceil(new_latency / time_per_chunk)
 
@@ -321,8 +388,6 @@ class RTCInferenceEngine(InferenceEngine):
                         else:
                             latency_tracker.add(new_latency)
 
-                        queue.merge(original, processed, new_delay, idx_before)
-
                         if (
                             is_warmup
                             and inference_count >= warmup_required
@@ -331,7 +396,29 @@ class RTCInferenceEngine(InferenceEngine):
                             self._compile_warmup_done.set()
                             logger.info("Compile warmup complete (%d inferences)", inference_count)
 
-                        logger.debug("RTC inference latency=%.2fs, queue=%d", new_latency, queue.qsize())
+                        committed = False
+                        with self._obs_lock:
+                            if (
+                                generation == self._generation
+                                and not self._resetting
+                                and self._policy_active.is_set()
+                                and queue is self._action_queue
+                            ):
+                                queue.merge(original, processed, new_delay, idx_before)
+                                committed = True
+
+                        if committed:
+                            logger.debug(
+                                "RTC inference latency=%.2fs, queue=%d",
+                                new_latency,
+                                queue.qsize(),
+                            )
+                        else:
+                            logger.debug(
+                                "Discarding RTC result from stale generation %d (current=%d)",
+                                generation,
+                                self._generation,
+                            )
 
                     except Exception as e:
                         consecutive_errors += 1

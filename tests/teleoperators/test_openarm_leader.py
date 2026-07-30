@@ -108,6 +108,7 @@ def test_defaults_match_validated_native_bilateral_leader(tmp_path):
     assert config.friction_fc_scale == list(BILATERAL_LEADER_FC_SCALE)
     assert config.friction_fv_scale == list(BILATERAL_LEADER_FV_SCALE)
     assert config.friction_fo_scale == list(BILATERAL_LEADER_FO_SCALE)
+    assert config.feedback_position_limit_tolerance_deg == 1.5
 
 
 def test_connect_never_writes_motor_zero(tmp_path):
@@ -121,6 +122,50 @@ def test_connect_never_writes_motor_zero(tmp_path):
     bus.set_zero_position.assert_not_called()
     bus.enable_torque.assert_called_once_with()
     assert bus._mit_control_batch.call_count == 1
+
+
+def test_connect_keyboard_interrupt_strictly_disables_and_closes_live_can(tmp_path):
+    leader, bus = _make_leader(tmp_path)
+    bus.sync_read_all_states.side_effect = KeyboardInterrupt
+    bus.disable_torque.side_effect = RuntimeError("disable ACK missing")
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        leader.connect()
+
+    bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)
+    bus.disconnect.assert_called_once_with(disable_torque=False)
+    assert not bus.is_connected
+    assert any("disable ACK missing" in note for note in exc_info.value.__notes__)
+
+
+def test_connect_interrupt_after_partial_can_open_is_cleaned_up(tmp_path):
+    leader, bus = _make_leader(tmp_path)
+
+    def interrupt_after_open() -> None:
+        bus.is_connected = True
+        raise KeyboardInterrupt
+
+    bus.connect.side_effect = interrupt_after_open
+
+    with pytest.raises(KeyboardInterrupt):
+        leader.connect()
+
+    bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)
+    bus.disconnect.assert_called_once_with(disable_torque=False)
+    assert not bus.is_connected
+
+
+def test_partial_live_can_disconnect_strictly_disables_and_always_closes(tmp_path):
+    leader, bus = _make_leader(tmp_path)
+    bus.is_connected = True
+    bus.disable_torque.side_effect = RuntimeError("disable ACK missing")
+
+    with pytest.raises(RuntimeError, match="disable ACK missing"):
+        leader.disconnect()
+
+    bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)
+    bus.disconnect.assert_called_once_with(disable_torque=False)
+    assert not bus.is_connected
 
 
 def test_generic_lerobot_calibration_is_rejected_without_writing_zero(tmp_path):
@@ -188,15 +233,39 @@ def test_send_feedback_applies_side_specific_urdf_gravity(tmp_path):
     assert commands["gripper"][4] == pytest.approx(0.0)
 
 
+def test_small_feedback_overshoot_is_clamped_to_physical_boundary(tmp_path):
+    leader, bus = _make_leader(tmp_path)
+    leader.connect()
+    bus._mit_control_batch.reset_mock()
+    bus.disable_torque.reset_mock()
+    feedback = _feedback(gripper=0.9)
+    feedback["gripper.vel"] = 12.0
+
+    leader.send_feedback(feedback)
+
+    command = bus._mit_control_batch.call_args.args[0]["gripper"]
+    assert command[2] == 0.0
+    assert command[3] == 0.0
+    bus.disable_torque.assert_not_called()
+
+
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), -0.1])
+def test_feedback_limit_tolerance_must_be_finite_and_non_negative(tmp_path, tolerance):
+    config = _config(tmp_path, feedback_position_limit_tolerance_deg=tolerance)
+
+    with pytest.raises(ValueError, match="feedback_position_limit_tolerance_deg"):
+        _make_leader(tmp_path, config)
+
+
 def test_invalid_feedback_disables_leader_before_raising(tmp_path):
     leader, bus = _make_leader(tmp_path)
     leader.connect()
     bus.disable_torque.reset_mock()
 
     with pytest.raises(ValueError, match="physical range"):
-        leader.send_feedback(_feedback(joint_1=-201.0))
+        leader.send_feedback(_feedback(joint_1=-202.0))
 
-    bus.disable_torque.assert_called_once_with()
+    bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)
     bus._mit_control_batch.assert_called_once()
 
 
@@ -204,13 +273,14 @@ def test_feedback_velocity_outside_mit_range_disables_leader(tmp_path):
     leader, bus = _make_leader(tmp_path)
     leader.connect()
     bus.disable_torque.reset_mock()
-    feedback = _feedback()
+    # A clampable position overshoot must not hide an invalid raw velocity.
+    feedback = _feedback(joint_3=90.9)
     feedback["joint_3.vel"] = math.degrees(8.0) + 1.0
 
     with pytest.raises(ValueError, match="feedback velocity.*MIT range"):
         leader.send_feedback(feedback)
 
-    bus.disable_torque.assert_called_once_with()
+    bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)
 
 
 def test_manual_control_keeps_legacy_free_motion_mode(tmp_path):
@@ -225,16 +295,15 @@ def test_manual_control_keeps_legacy_free_motion_mode(tmp_path):
         leader.send_feedback(_feedback())
 
 
-def test_bimanual_feedback_routes_sides_and_disables_both_on_error(tmp_path):
+def test_bimanual_feedback_validates_both_sides_before_sending_and_disables_on_error(tmp_path):
     left_arm = MagicMock(name="left_arm")
     right_arm = MagicMock(name="right_arm")
-    left_arm.is_connected = True
-    right_arm.is_connected = True
-    left_arm.requires_continuous_feedback = True
-    right_arm.requires_continuous_feedback = True
-    left_arm.feedback_features = {"joint_1.pos": float}
-    right_arm.feedback_features = {"joint_1.pos": float}
-    right_arm.send_feedback.side_effect = RuntimeError("right feedback failed")
+    for arm in (left_arm, right_arm):
+        arm.bus.is_connected = True
+        arm.requires_continuous_feedback = True
+        arm.feedback_features = {"joint_1.pos": float}
+    left_arm._prepare_bilateral_feedback.return_value = {"joint_1": "left command"}
+    right_arm._prepare_bilateral_feedback.side_effect = RuntimeError("right feedback failed")
     config = BiOpenArmLeaderConfig(
         id="leader",
         calibration_dir=tmp_path,
@@ -250,10 +319,98 @@ def test_bimanual_feedback_routes_sides_and_disables_both_on_error(tmp_path):
     with pytest.raises(RuntimeError, match="right feedback failed"):
         leader.send_feedback({"left_joint_1.pos": 1.0, "right_joint_1.pos": 2.0})
 
-    left_arm.send_feedback.assert_called_once_with({"joint_1.pos": 1.0})
-    right_arm.send_feedback.assert_called_once_with({"joint_1.pos": 2.0})
-    left_arm.disable_torque.assert_called_once_with()
-    right_arm.disable_torque.assert_called_once_with()
+    left_arm._prepare_bilateral_feedback.assert_called_once_with({"joint_1.pos": 1.0})
+    right_arm._prepare_bilateral_feedback.assert_called_once_with({"joint_1.pos": 2.0})
+    left_arm._send_prepared_bilateral_feedback.assert_not_called()
+    right_arm._send_prepared_bilateral_feedback.assert_not_called()
+    left_arm.disable_torque.assert_called_once_with(require_response=True)
+    right_arm.disable_torque.assert_called_once_with(require_response=True)
+
+
+def test_bimanual_feedback_preserves_error_and_reports_strict_disable_failure(tmp_path):
+    left_arm = MagicMock(name="left_arm")
+    right_arm = MagicMock(name="right_arm")
+    for arm in (left_arm, right_arm):
+        arm.bus.is_connected = True
+        arm.requires_continuous_feedback = True
+        arm.feedback_features = {"joint_1.pos": float}
+    feedback_error = RuntimeError("right feedback failed")
+    left_arm._prepare_bilateral_feedback.return_value = {"joint_1": "left command"}
+    right_arm._prepare_bilateral_feedback.side_effect = feedback_error
+    left_arm.disable_torque.side_effect = RuntimeError("left disable ACK missing")
+    config = BiOpenArmLeaderConfig(
+        id="leader",
+        calibration_dir=tmp_path,
+        left_arm_config=OpenArmLeaderConfigBase(port="can1", gravity_compensation=False),
+        right_arm_config=OpenArmLeaderConfigBase(port="can0", gravity_compensation=False),
+    )
+    with patch(f"{_BI_MODULE}.OpenArmLeader", side_effect=(left_arm, right_arm)):
+        leader = BiOpenArmLeader(config)
+
+    with pytest.raises(RuntimeError, match="right feedback failed") as exc_info:
+        leader.send_feedback({"left_joint_1.pos": 1.0, "right_joint_1.pos": 2.0})
+
+    left_arm.disable_torque.assert_called_once_with(require_response=True)
+    right_arm.disable_torque.assert_called_once_with(require_response=True)
+    assert any("left disable ACK missing" in note for note in exc_info.value.__notes__)
+
+
+def test_bimanual_strict_disable_attempts_both_arms_and_propagates_failure(tmp_path):
+    left_arm = MagicMock(name="left_arm")
+    right_arm = MagicMock(name="right_arm")
+    for arm in (left_arm, right_arm):
+        arm.bus.is_connected = True
+    left_arm.disable_torque.side_effect = RuntimeError("left disable ACK missing")
+    config = BiOpenArmLeaderConfig(
+        id="leader",
+        calibration_dir=tmp_path,
+        left_arm_config=OpenArmLeaderConfigBase(port="can1", gravity_compensation=False),
+        right_arm_config=OpenArmLeaderConfigBase(port="can0", gravity_compensation=False),
+    )
+    with patch(f"{_BI_MODULE}.OpenArmLeader", side_effect=(left_arm, right_arm)):
+        leader = BiOpenArmLeader(config)
+
+    with pytest.raises(RuntimeError, match="bilateral.*left") as exc_info:
+        leader.disable_torque(require_response=True)
+
+    left_arm.disable_torque.assert_called_once_with(require_response=True)
+    right_arm.disable_torque.assert_called_once_with(require_response=True)
+    assert any("left disable ACK missing" in note for note in exc_info.value.__notes__)
+
+
+def test_bimanual_connect_keyboard_interrupt_disconnects_every_live_arm(tmp_path):
+    left_arm = MagicMock(name="left_arm")
+    right_arm = MagicMock(name="right_arm")
+    for arm in (left_arm, right_arm):
+        arm.is_connected = False
+        arm.bus.is_connected = False
+        arm.cameras = {}
+
+    def connect_left(_calibrate=True):
+        left_arm.bus.is_connected = True
+
+    def interrupt_right(_calibrate=True):
+        right_arm.bus.is_connected = True
+        raise KeyboardInterrupt
+
+    left_arm.connect.side_effect = connect_left
+    right_arm.connect.side_effect = interrupt_right
+    left_arm.disconnect.side_effect = RuntimeError("left close failed")
+    config = BiOpenArmLeaderConfig(
+        id="leader",
+        calibration_dir=tmp_path,
+        left_arm_config=OpenArmLeaderConfigBase(port="can1", gravity_compensation=False),
+        right_arm_config=OpenArmLeaderConfigBase(port="can0", gravity_compensation=False),
+    )
+    with patch(f"{_BI_MODULE}.OpenArmLeader", side_effect=(left_arm, right_arm)):
+        leader = BiOpenArmLeader(config)
+
+    with pytest.raises(KeyboardInterrupt) as exc_info:
+        leader.connect()
+
+    left_arm.disconnect.assert_called_once_with()
+    right_arm.disconnect.assert_called_once_with()
+    assert any("left close failed" in note for note in exc_info.value.__notes__)
 
 
 def test_bimanual_rejects_mixed_free_motion_and_bilateral_modes(tmp_path):
@@ -271,7 +428,7 @@ def test_bimanual_rejects_mixed_free_motion_and_bilateral_modes(tmp_path):
 def test_bimanual_shutdown_error_hold_survives_disconnect_cleanup(tmp_path):
     left_arm = MagicMock(name="left_arm")
     right_arm = MagicMock(name="right_arm")
-    for arm in (left_arm, right_arm):
+    for side, arm in (("left", left_arm), ("right", right_arm)):
         arm.bus.is_connected = True
         arm.config.disable_torque_on_disconnect = True
         arm.get_action.return_value = {
@@ -279,6 +436,7 @@ def test_bimanual_shutdown_error_hold_survives_disconnect_cleanup(tmp_path):
             "joint_1.vel": 2.0,
             "joint_1.torque": 3.0,
         }
+        arm._prepare_bilateral_feedback.return_value = {"joint_1": f"{side} command"}
     config = BiOpenArmLeaderConfig(
         id="leader",
         calibration_dir=tmp_path,
@@ -288,11 +446,47 @@ def test_bimanual_shutdown_error_hold_survives_disconnect_cleanup(tmp_path):
     with patch(f"{_BI_MODULE}.OpenArmLeader", side_effect=(left_arm, right_arm)):
         leader = BiOpenArmLeader(config)
 
-    leader.hold_position_after_shutdown_error()
+    assert leader.hold_position_after_shutdown_error()
 
     assert not config.left_arm_config.disable_torque_on_disconnect
     assert not config.right_arm_config.disable_torque_on_disconnect
     assert not left_arm.config.disable_torque_on_disconnect
     assert not right_arm.config.disable_torque_on_disconnect
-    left_arm.send_feedback.assert_called_once_with({"joint_1.pos": 1.0})
-    right_arm.send_feedback.assert_called_once_with({"joint_1.pos": 1.0})
+    for side, arm in (("left", left_arm), ("right", right_arm)):
+        arm.get_action.assert_called_once_with(require_response=True)
+        arm._prepare_bilateral_feedback.assert_called_once_with({"joint_1.pos": 1.0})
+        assert arm._send_prepared_bilateral_feedback.call_count == 2
+        arm._send_prepared_bilateral_feedback.assert_called_with(
+            {"joint_1": f"{side} command"},
+            require_response=True,
+        )
+        arm.enable_torque.assert_called_once_with(require_response=True)
+
+
+def test_bimanual_failed_hold_disables_both_and_preserves_disconnect_safety(tmp_path, caplog):
+    left_arm = MagicMock(name="left_arm")
+    right_arm = MagicMock(name="right_arm")
+    for arm in (left_arm, right_arm):
+        arm.bus.is_connected = True
+        arm.config.disable_torque_on_disconnect = False
+        arm.get_action.return_value = {"joint_1.pos": 1.0}
+        arm._prepare_bilateral_feedback.return_value = {"joint_1": "command"}
+    right_arm.enable_torque.side_effect = RuntimeError("enable failed")
+    config = BiOpenArmLeaderConfig(
+        id="leader",
+        calibration_dir=tmp_path,
+        left_arm_config=OpenArmLeaderConfigBase(port="can1", gravity_compensation=False),
+        right_arm_config=OpenArmLeaderConfigBase(port="can0", gravity_compensation=False),
+    )
+    with patch(f"{_BI_MODULE}.OpenArmLeader", side_effect=(left_arm, right_arm)):
+        leader = BiOpenArmLeader(config)
+
+    assert not leader.secure_current_position_hold()
+
+    assert config.left_arm_config.disable_torque_on_disconnect
+    assert config.right_arm_config.disable_torque_on_disconnect
+    assert left_arm.config.disable_torque_on_disconnect
+    assert right_arm.config.disable_torque_on_disconnect
+    left_arm.disable_torque.assert_called_once_with(require_response=True)
+    right_arm.disable_torque.assert_called_once_with(require_response=True)
+    assert "hold was not established" in caplog.text

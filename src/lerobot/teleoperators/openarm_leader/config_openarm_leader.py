@@ -107,6 +107,11 @@ class OpenArmLeaderConfigBase:
     position_kp: list[float] = field(default_factory=lambda: list(BILATERAL_LEADER_KP))
     position_kd: list[float] = field(default_factory=lambda: list(BILATERAL_LEADER_KD))
 
+    # Measured follower positions can overshoot a hard stop slightly before the
+    # next CAN sample arrives. Clamp only a small, finite excursion to the
+    # physical boundary; larger excursions remain a bilateral fault.
+    feedback_position_limit_tolerance_deg: float = 1.5
+
     # Native bilateral leader feed-forward compensation. Gravity is computed
     # from the same v10 bimanual URDF; friction uses motor-zero radians/second.
     # J7 scales match Dora's validated profile.

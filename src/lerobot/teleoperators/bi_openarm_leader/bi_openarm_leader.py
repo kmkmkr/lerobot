@@ -63,6 +63,9 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
             use_velocity_and_torque=config.left_arm_config.use_velocity_and_torque,
             position_kd=config.left_arm_config.position_kd,
             position_kp=config.left_arm_config.position_kp,
+            feedback_position_limit_tolerance_deg=(
+                config.left_arm_config.feedback_position_limit_tolerance_deg
+            ),
             gravity_compensation=config.left_arm_config.gravity_compensation,
             friction_compensation=config.left_arm_config.friction_compensation,
             dynamics_urdf_path=config.left_arm_config.dynamics_urdf_path,
@@ -95,6 +98,9 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
             use_velocity_and_torque=config.right_arm_config.use_velocity_and_torque,
             position_kd=config.right_arm_config.position_kd,
             position_kp=config.right_arm_config.position_kp,
+            feedback_position_limit_tolerance_deg=(
+                config.right_arm_config.feedback_position_limit_tolerance_deg
+            ),
             gravity_compensation=config.right_arm_config.gravity_compensation,
             friction_compensation=config.right_arm_config.friction_compensation,
             dynamics_urdf_path=config.right_arm_config.dynamics_urdf_path,
@@ -148,16 +154,18 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
         try:
             self.left_arm.connect(calibrate)
             self.right_arm.connect(calibrate)
-        except Exception:
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
             for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
-                if not arm.bus.is_connected:
+                if not self._arm_has_live_connection(arm):
                     continue
                 try:
                     arm.disconnect()
-                except Exception as error:
-                    logger.error(
-                        "Failed to disconnect %s OpenArm leader after connect error: %s", side, error
-                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                    logger.exception("Failed to disconnect %s OpenArm leader after connect error", side)
+            for cleanup_error in cleanup_errors:
+                error.add_note(f"Additional bimanual leader connection cleanup error: {cleanup_error!r}")
             raise
 
     @check_if_not_connected
@@ -175,6 +183,8 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
         return action_dict
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
+        if not self.requires_continuous_feedback:
+            raise RuntimeError("send_feedback is unavailable in manual_control free-motion mode")
         left_feedback = {
             key.removeprefix("left_"): value for key, value in feedback.items() if key.startswith("left_")
         }
@@ -182,54 +192,155 @@ class BiOpenArmLeader(BimanualMixin, Teleoperator):
             key.removeprefix("right_"): value for key, value in feedback.items() if key.startswith("right_")
         }
         try:
-            self.left_arm.send_feedback(left_feedback)
-            self.right_arm.send_feedback(right_feedback)
-        except Exception:
-            self.disable_torque()
+            # Prepare both sides before either CAN bus receives a new target.
+            # This prevents a right-side validation fault from leaving only the
+            # left leader operating on the next feedback sample.
+            left_commands = self.left_arm._prepare_bilateral_feedback(left_feedback)
+            right_commands = self.right_arm._prepare_bilateral_feedback(right_feedback)
+            self.left_arm._send_prepared_bilateral_feedback(left_commands)
+            self.right_arm._send_prepared_bilateral_feedback(right_commands)
+        except BaseException as error:
+            try:
+                self.disable_torque(require_response=True)
+            except BaseException as disable_error:
+                error.add_note(f"Failed to verify bilateral leader torque disable: {disable_error!r}")
+                logger.exception("Failed to verify both OpenArm leader torque disables")
             raise
 
-    def hold_position_after_shutdown_error(self) -> None:
-        """Keep both leaders energized at their measured pose after a failed return.
-
-        The coordinated OpenArm shutdown path uses the same fail-safe as the
-        followers: refresh a current-position command, then close CAN without
-        disabling torque so none of the four arms free-falls unexpectedly.
-        """
-        for side, source_config, arm in (
-            ("left", self.config.left_arm_config, self.left_arm),
-            ("right", self.config.right_arm_config, self.right_arm),
+    def _set_disable_torque_on_disconnect(self, disable_torque: bool) -> None:
+        for source_config, arm in (
+            (self.config.left_arm_config, self.left_arm),
+            (self.config.right_arm_config, self.right_arm),
         ):
-            source_config.disable_torque_on_disconnect = False
-            arm.config.disable_torque_on_disconnect = False
+            source_config.disable_torque_on_disconnect = disable_torque
+            arm.config.disable_torque_on_disconnect = disable_torque
+
+    def _disable_connected_arms(
+        self, *, require_response: bool = False
+    ) -> tuple[dict[str, str], list[tuple[str, BaseException]]]:
+        statuses: dict[str, str] = {}
+        failures: list[tuple[str, BaseException]] = []
+        for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
             if not arm.bus.is_connected:
-                logger.error("Cannot refresh the %s OpenArm leader hold because its CAN bus is closed", side)
+                statuses[side] = "CAN disconnected; torque state unknown"
                 continue
             try:
-                action = arm.get_action()
-                feedback = {key: float(value) for key, value in action.items() if key.endswith(".pos")}
-                arm.send_feedback(feedback)
-            except Exception:
-                logger.exception("Failed to refresh the %s OpenArm leader hold command", side)
+                if require_response:
+                    arm.disable_torque(require_response=True)
+                else:
+                    arm.disable_torque()
+            except BaseException as error:
+                statuses[side] = f"torque-disable failed: {error}"
+                failures.append((side, error))
+                logger.exception("Failed to disable %s OpenArm leader torque", side)
+            else:
+                statuses[side] = (
+                    "torque-disable response verified"
+                    if require_response
+                    else "torque-disable command completed"
+                )
+        return statuses, failures
 
-        logger.critical(
-            "OpenArm coordinated shutdown return failed. Both leaders will remain torque-enabled "
-            "at their measured pose when CAN is disconnected. Support all arms before removing "
-            "power or manually disabling torque."
+    def secure_current_position_hold(self) -> bool:
+        """Establish and verify a measured-position hold on both leaders.
+
+        Safe references are prepared for both sides and preloaded before torque
+        is enabled. Only after both enable calls and both post-enable hold
+        commands complete do we preserve torque across CAN disconnect.
+        """
+        arms = (
+            ("left", self.config.left_arm_config, self.left_arm),
+            ("right", self.config.right_arm_config, self.right_arm),
         )
-
-    @check_if_not_connected
-    def disable_torque(self) -> None:
-        for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
-            try:
-                arm.disable_torque()
-            except Exception as error:
-                logger.error("Failed to disable %s OpenArm leader torque: %s", side, error)
-
-    @check_if_not_connected
-    def enable_torque(self) -> None:
+        self._set_disable_torque_on_disconnect(True)
+        prepared: dict[str, dict[str, tuple[float, float, float, float, float]]] = {}
         try:
-            self.left_arm.enable_torque()
-            self.right_arm.enable_torque()
-        except Exception:
-            self.disable_torque()
+            for side, _source_config, arm in arms:
+                if not arm.bus.is_connected:
+                    raise RuntimeError(f"{side} leader CAN bus is closed")
+                action = arm.get_action(require_response=True)
+                feedback = {key: float(value) for key, value in action.items() if key.endswith(".pos")}
+                prepared[side] = arm._prepare_bilateral_feedback(feedback)
+
+            # Preload safe measured-position references before re-enabling a
+            # leader that a feedback fault may already have disabled.
+            for side, _source_config, arm in arms:
+                arm._send_prepared_bilateral_feedback(prepared[side], require_response=True)
+            for _side, _source_config, arm in arms:
+                arm.enable_torque(require_response=True)
+            for side, _source_config, arm in arms:
+                arm._send_prepared_bilateral_feedback(prepared[side], require_response=True)
+        except BaseException as error:
+            statuses, disable_failures = self._disable_connected_arms(require_response=True)
+            self._set_disable_torque_on_disconnect(True)
+            logger.critical(
+                "OpenArm leader current-position hold was not established after fault: %s. "
+                "Fail-safe status: left=%s; right=%s. Support all arms before removing power.",
+                error,
+                statuses["left"],
+                statuses["right"],
+            )
+            for side, disable_error in disable_failures:
+                error.add_note(f"Additional {side} leader disable error: {disable_error!r}")
+            if not isinstance(error, Exception):
+                raise
+            for side, disable_error in disable_failures:
+                if not isinstance(disable_error, Exception):
+                    disable_error.add_note(
+                        f"Leader hold failed before the {side} disable interruption: {error!r}"
+                    )
+                    raise disable_error from error
+            return False
+
+        self._set_disable_torque_on_disconnect(False)
+        logger.critical(
+            "OpenArm leaders are held at their measured positions: both current-position commands "
+            "and both torque-enable operations completed. Torque will be preserved across CAN "
+            "disconnect; support all arms before removing power or manually disabling torque."
+        )
+        return True
+
+    def hold_position_after_shutdown_error(self) -> bool:
+        """Compatibility entry point for shutdown and fault teardown."""
+        return self.secure_current_position_hold()
+
+    def disable_torque(self, *, require_response: bool = False) -> None:
+        statuses, disable_failures = self._disable_connected_arms(require_response=require_response)
+        signal_failures = [
+            (side, error) for side, error in disable_failures if not isinstance(error, Exception)
+        ]
+        if signal_failures:
+            first_side, first_error = signal_failures[0]
+            for side, error in disable_failures:
+                if error is not first_error:
+                    first_error.add_note(f"Additional {side} leader disable error: {error!r}")
+            first_error.add_note(f"First leader disable interruption occurred on {first_side}")
+            raise first_error
+        if not require_response:
+            return
+
+        failures = {
+            side: status for side, status in statuses.items() if status != "torque-disable response verified"
+        }
+        if failures:
+            details = ", ".join(f"{side}={status}" for side, status in failures.items())
+            error = RuntimeError(f"Failed to verify bilateral OpenArm leader torque disable: {details}")
+            for side, status in failures.items():
+                error.add_note(f"{side}: {status}")
+            raise error
+
+    @check_if_not_connected
+    def enable_torque(self, *, require_response: bool = False) -> None:
+        try:
+            if require_response:
+                self.left_arm.enable_torque(require_response=True)
+                self.right_arm.enable_torque(require_response=True)
+            else:
+                self.left_arm.enable_torque()
+                self.right_arm.enable_torque()
+        except BaseException as error:
+            try:
+                self.disable_torque(require_response=require_response)
+            except BaseException as disable_error:
+                error.add_note(f"Failed to disable both leaders after enable error: {disable_error!r}")
             raise

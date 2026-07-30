@@ -143,6 +143,11 @@ class OpenArmLeader(Teleoperator):
             or config.compensation_state_max_age_s < 0.0
         ):
             raise ValueError("compensation_state_max_age_s must be finite and non-negative")
+        if (
+            not math.isfinite(config.feedback_position_limit_tolerance_deg)
+            or config.feedback_position_limit_tolerance_deg < 0.0
+        ):
+            raise ValueError("feedback_position_limit_tolerance_deg must be finite and non-negative")
         if not math.isfinite(config.gravity_m_s2) or config.gravity_m_s2 <= 0.0:
             raise ValueError("gravity_m_s2 must be positive and finite")
         if not math.isfinite(config.friction_tanh_coefficient) or config.friction_tanh_coefficient <= 0.0:
@@ -204,31 +209,43 @@ class OpenArmLeader(Teleoperator):
 
         self._prepare_gravity_model()
 
-        # Connect to CAN bus
-        logger.info(f"Connecting arm on {self.config.port}...")
-        self.bus.connect()
-
-        if calibrate:
-            logger.info(
-                "Using the existing OpenArm motor zero. LeRobot will not write or replace zero positions."
-            )
-
         try:
+            # Keep the CAN connection itself in the cleanup scope. A signal can
+            # arrive after the socket opens but before connect() returns.
+            logger.info(f"Connecting arm on {self.config.port}...")
+            self.bus.connect()
+
+            if calibrate:
+                logger.info(
+                    "Using the existing OpenArm motor zero. LeRobot will not write or replace zero positions."
+                )
+
             self.configure()
             if not self.config.manual_control:
                 states = self._read_motor_states()
                 initial_feedback = {f"{motor}.pos": states[motor]["position"] for motor in self.bus.motors}
                 self.bus.enable_torque()
                 self._send_bilateral_feedback(initial_feedback)
-        except Exception as error:
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
             try:
-                self.bus.disable_torque()
-            except Exception as disable_error:
-                logger.error("Failed to disable OpenArm leader after connect error: %s", disable_error)
-            try:
-                self.bus.disconnect(disable_torque=False)
-            except Exception as disconnect_error:
-                logger.error("Failed to disconnect OpenArm leader after connect error: %s", disconnect_error)
+                bus_connected = bool(self.bus.is_connected)
+            except BaseException as state_error:
+                cleanup_errors.append(state_error)
+                bus_connected = True
+            if bus_connected:
+                try:
+                    self.bus.disable_torque(num_retry=2, require_response=True)
+                except BaseException as disable_error:
+                    cleanup_errors.append(disable_error)
+                    logger.exception("Failed to verify OpenArm leader torque disable after connect error")
+                try:
+                    self.bus.disconnect(disable_torque=False)
+                except BaseException as disconnect_error:
+                    cleanup_errors.append(disconnect_error)
+                    logger.exception("Failed to close OpenArm leader CAN after connect error")
+            for cleanup_error in cleanup_errors:
+                error.add_note(f"Additional OpenArm leader connection cleanup error: {cleanup_error!r}")
             logger.error("OpenArm leader connect failed: %s", error)
             raise
 
@@ -263,7 +280,7 @@ class OpenArmLeader(Teleoperator):
         )
 
     @check_if_not_connected
-    def get_action(self) -> RobotAction:
+    def get_action(self, *, require_response: bool = False) -> RobotAction:
         """
         Get current action from the leader arm.
 
@@ -277,7 +294,7 @@ class OpenArmLeader(Teleoperator):
         action_dict: dict[str, Any] = {}
 
         # Use sync_read_all_states to get pos/vel/torque in one go
-        states = self._read_motor_states()
+        states = self._read_motor_states(require_response=require_response)
         for motor in self.bus.motors:
             state = states.get(motor, {})
             action_dict[f"{motor}.pos"] = state.get("position")
@@ -290,8 +307,11 @@ class OpenArmLeader(Teleoperator):
 
         return action_dict
 
-    def _read_motor_states(self) -> dict[str, dict[str, float]]:
-        states = self.bus.sync_read_all_states()
+    def _read_motor_states(self, *, require_response: bool = False) -> dict[str, dict[str, float]]:
+        if require_response:
+            states = self.bus.sync_read_all_states(num_retry=2, require_response=True)
+        else:
+            states = self.bus.sync_read_all_states()
         self._latest_motor_states = {
             motor: {key: float(value) for key, value in state.items()} for motor, state in states.items()
         }
@@ -344,7 +364,10 @@ class OpenArmLeader(Teleoperator):
             torques[motor_name] = torque
         return torques
 
-    def _send_bilateral_feedback(self, feedback: dict[str, float]) -> None:
+    def _prepare_bilateral_feedback(
+        self, feedback: dict[str, float]
+    ) -> dict[str, tuple[float, float, float, float, float]]:
+        """Validate one complete feedback sample without sending a CAN command."""
         motor_names = list(self.bus.motors)
         missing = [f"{motor}.pos" for motor in motor_names if f"{motor}.pos" not in feedback]
         if missing:
@@ -361,12 +384,6 @@ class OpenArmLeader(Teleoperator):
                 raise ValueError(
                     f"OpenArm leader feedback for {motor_name} must contain finite position/velocity"
                 )
-            minimum, maximum = physical_limits[motor_name]
-            if not minimum <= position <= maximum:
-                raise ValueError(
-                    f"OpenArm leader feedback target is outside the {self.config.side} {motor_name} "
-                    f"physical range: value={position} allowed=[{minimum}, {maximum}] deg"
-                )
             motor_type_name = self.config.motor_config[motor_name][2].upper().replace("-", "_")
             motor_type = getattr(MotorType, motor_type_name)
             velocity_limit_deg_s = math.degrees(MOTOR_LIMIT_PARAMS[motor_type][1])
@@ -375,6 +392,30 @@ class OpenArmLeader(Teleoperator):
                     f"OpenArm leader feedback velocity is outside the {motor_name} MIT range: "
                     f"value={velocity} allowed=[{-velocity_limit_deg_s}, {velocity_limit_deg_s}] deg/s"
                 )
+            minimum, maximum = physical_limits[motor_name]
+            if not minimum <= position <= maximum:
+                clamped_position = min(max(position, minimum), maximum)
+                overshoot = abs(position - clamped_position)
+                if overshoot > self.config.feedback_position_limit_tolerance_deg:
+                    raise ValueError(
+                        f"OpenArm leader feedback target is outside the {self.config.side} {motor_name} "
+                        f"physical range: value={position} allowed=[{minimum}, {maximum}] deg "
+                        f"overshoot={overshoot} tolerance="
+                        f"{self.config.feedback_position_limit_tolerance_deg} deg"
+                    )
+                logger.warning(
+                    "Clamped %s OpenArm leader feedback at the physical boundary: "
+                    "motor=%s requested=%.3f sent=%.3f overshoot=%.3f tolerance=%.3f deg",
+                    self.config.side,
+                    motor_name,
+                    position,
+                    clamped_position,
+                    overshoot,
+                    self.config.feedback_position_limit_tolerance_deg,
+                )
+                position = clamped_position
+                # Do not retain an outward velocity reference at a hard stop.
+                velocity = 0.0
             commands[motor_name] = (
                 self.config.position_kp[index],
                 self.config.position_kd[index],
@@ -383,7 +424,26 @@ class OpenArmLeader(Teleoperator):
                 compensation_torques[motor_name],
             )
 
-        self.bus._mit_control_batch(commands)
+        return commands
+
+    def _send_prepared_bilateral_feedback(
+        self,
+        commands: dict[str, tuple[float, float, float, float, float]],
+        *,
+        require_response: bool = False,
+    ) -> None:
+        """Send commands produced by :meth:`_prepare_bilateral_feedback`."""
+        if require_response:
+            self.bus._mit_control_batch(commands, require_response=True)
+        else:
+            self.bus._mit_control_batch(commands)
+
+    def _send_bilateral_feedback(self, feedback: dict[str, float], *, require_response: bool = False) -> None:
+        commands = self._prepare_bilateral_feedback(feedback)
+        if require_response:
+            self._send_prepared_bilateral_feedback(commands, require_response=True)
+        else:
+            self._send_prepared_bilateral_feedback(commands)
 
     @check_if_not_connected
     def send_feedback(self, feedback: dict[str, float]) -> None:
@@ -392,25 +452,47 @@ class OpenArmLeader(Teleoperator):
             raise RuntimeError("send_feedback is unavailable in manual_control free-motion mode")
         try:
             self._send_bilateral_feedback(feedback)
-        except Exception as error:
+        except BaseException as error:
             try:
-                self.bus.disable_torque()
-            except Exception as disable_error:
-                logger.error("Failed to disable OpenArm leader after feedback error: %s", disable_error)
+                self.bus.disable_torque(num_retry=2, require_response=True)
+            except BaseException as disable_error:
+                error.add_note(f"Failed to verify leader torque disable: {disable_error!r}")
+                logger.exception("Failed to verify OpenArm leader torque disable after feedback error")
             logger.error("OpenArm leader feedback failed: %s", error)
             raise
 
     @check_if_not_connected
-    def disable_torque(self) -> None:
-        self.bus.disable_torque()
+    def disable_torque(self, *, require_response: bool = False) -> None:
+        if require_response:
+            self.bus.disable_torque(num_retry=2, require_response=True)
+        else:
+            self.bus.disable_torque()
 
     @check_if_not_connected
-    def enable_torque(self) -> None:
-        self.bus.enable_torque()
+    def enable_torque(self, *, require_response: bool = False) -> None:
+        if require_response:
+            self.bus.enable_torque(num_retry=2, require_response=True)
+        else:
+            self.bus.enable_torque()
 
-    @check_if_not_connected
     def disconnect(self) -> None:
-        """Disconnect from teleoperator."""
-
-        self.bus.disconnect(disable_torque=self.config.disable_torque_on_disconnect)
+        """Strictly disable when requested, then always close a live CAN bus."""
+        errors: list[BaseException] = []
+        if self.bus.is_connected:
+            if self.config.disable_torque_on_disconnect:
+                try:
+                    self.bus.disable_torque(num_retry=2, require_response=True)
+                except BaseException as error:
+                    error.add_note("Failed to verify OpenArm leader torque disable before CAN close")
+                    errors.append(error)
+            try:
+                self.bus.disconnect(disable_torque=False)
+            except BaseException as error:
+                error.add_note("Failed while closing the OpenArm leader CAN bus")
+                errors.append(error)
         logger.info(f"{self} disconnected.")
+        if errors:
+            first_error = errors[0]
+            for additional_error in errors[1:]:
+                first_error.add_note(f"Additional OpenArm leader disconnect error: {additional_error!r}")
+            raise first_error

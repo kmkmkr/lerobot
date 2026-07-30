@@ -212,31 +212,98 @@ def rollout(cfg: RolloutConfig):
         )
         init_visualization(cfg.display_mode, session_name="rollout", ip=cfg.display_ip, port=cfg.display_port)
 
-    signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
+    # A rollout signal must interrupt model loading/startup/control immediately.
+    # The context and strategy teardown paths convert that BaseException into a
+    # no-return-motion fault cleanup.
+    signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False, raise_on_first_signal=True)
     shutdown_event = signal_handler.shutdown_event
 
-    logger.info("Building rollout context...")
-    ctx = build_rollout_context(cfg, shutdown_event)
-
     strategy = create_strategy(cfg.strategy)
-    logger.info("Rollout strategy: %s", cfg.strategy.type)
-    logger.info(
-        "Robot: %s | FPS: %.0f | Duration: %s",
-        cfg.robot.type if cfg.robot else "?",
-        cfg.fps,
-        f"{cfg.duration}s" if cfg.duration > 0 else "infinite",
-    )
-
+    ctx = None
+    context_handoff = []
+    primary_error: BaseException | None = None
     try:
+        logger.info("Building rollout context...")
+        ctx = build_rollout_context(
+            cfg,
+            shutdown_event,
+            context_ready_callback=context_handoff.append,
+        )
+
+        # Keep post-build work inside the lifecycle guard. Once context
+        # construction returns, this function owns connected hardware and every
+        # BaseException must reach strategy teardown.
+        logger.info("Rollout strategy: %s", cfg.strategy.type)
+        logger.info(
+            "Robot: %s | FPS: %.0f | Duration: %s",
+            cfg.robot.type if cfg.robot else "?",
+            cfg.fps,
+            f"{cfg.duration}s" if cfg.duration > 0 else "infinite",
+        )
+
         strategy.setup(ctx)
         logger.info("Rollout setup complete, starting rollout...")
         strategy.run(ctx)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as error:
+        primary_error = error
+        if ctx is None and context_handoff:
+            ctx = context_handoff[-1]
+        if ctx is not None:
+            ctx.hardware.control_fault = error
         logger.info("Interrupted by user")
+        raise
+    except BaseException as error:
+        primary_error = error
+        if ctx is None and context_handoff:
+            ctx = context_handoff[-1]
+        if ctx is not None:
+            ctx.hardware.control_fault = error
+        raise
     finally:
-        strategy.teardown(ctx)
+        try:
+            if ctx is None and context_handoff:
+                ctx = context_handoff[-1]
+            if ctx is not None:
+                strategy.teardown(ctx)
+        except BaseException as teardown_error:
+            # This also catches a signal immediately before the teardown call.
+            if ctx is None and context_handoff:
+                ctx = context_handoff[-1]
+            if ctx is None:
+                raise
+            # A first shutdown signal can arrive while teardown itself is
+            # running. Convert it (and any other teardown BaseException)
+            # into a no-return control fault, then retry if hardware cleanup
+            # did not reach its terminal state.
+            if ctx.hardware.control_fault is None:
+                ctx.hardware.control_fault = teardown_error
+            if not bool(getattr(ctx.hardware, "teardown_complete", False)):
+                logger.critical(
+                    "Teardown was interrupted before hardware shutdown completed; retrying in fault mode"
+                )
+                try:
+                    strategy.teardown(ctx)
+                except BaseException as retry_error:
+                    teardown_error.add_note(f"Additional teardown retry error: {retry_error!r}")
+                    logger.exception("Fault-mode teardown retry also failed")
+
+            if primary_error is None:
+                raise
+            if isinstance(primary_error, KeyboardInterrupt):
+                teardown_error.add_note(
+                    "The rollout was interrupted while this teardown failure occurred"
+                )
+                raise teardown_error from primary_error
+            primary_error.add_note(f"Additional teardown error: {teardown_error!r}")
+            logger.exception("Teardown also failed; preserving the original rollout exception")
         if cfg.display_data:
-            shutdown_visualization(cfg.display_mode)
+            try:
+                shutdown_visualization(cfg.display_mode)
+            except BaseException as visualization_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(f"Additional visualization shutdown error: {visualization_error!r}")
+                logger.exception("Visualization shutdown failed; preserving the rollout error")
 
     logger.info("Rollout finished")
 

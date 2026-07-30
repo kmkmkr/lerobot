@@ -23,8 +23,12 @@ neither ``pynput`` nor a real terminal.
 """
 
 import io
+import os
 import platform
+import pty
 import sys
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +40,7 @@ from lerobot.utils.keyboard_input import (
     init_keyboard_listener,
     is_headless,
     is_wayland,
+    key_listener_is_alive,
     pynput_can_capture,
     pynput_listener_is_trusted,
 )
@@ -110,6 +115,7 @@ def test_is_wayland(monkeypatch, env, expected):
 def test_pynput_can_capture(monkeypatch, system, env, pynput_available, expected):
     _set_platform(monkeypatch, system)
     monkeypatch.setattr(ki, "_pynput_available", pynput_available)
+    monkeypatch.setattr(ki, "_x11_record_available", lambda: True)
     for var in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"):
         monkeypatch.delenv(var, raising=False)
     for key, value in env.items():
@@ -226,3 +232,129 @@ def test_create_key_listener_none_without_tty(monkeypatch):
     monkeypatch.setattr(ki, "pynput_can_capture", lambda: False)
     _set_tty(monkeypatch, is_tty=False)
     assert create_key_listener(lambda name: None) is None
+
+
+def test_create_key_listener_prefers_terminal_even_when_display_is_available(monkeypatch):
+    """Interactive rollouts must not select a fragile container X11 hook over their TTY."""
+    monkeypatch.setattr(ki, "pynput_can_capture", lambda: True)
+    _set_tty(monkeypatch, is_tty=True)
+    monkeypatch.setattr(TerminalKeyListener, "start", lambda self: None)
+
+    def unexpected_listener(*, on_press):
+        raise AssertionError("pynput must not be constructed when terminal input is preferred")
+
+    monkeypatch.setattr(ki, "keyboard", SimpleNamespace(Listener=unexpected_listener))
+
+    listener = create_key_listener(lambda name: None, prefer_terminal=True)
+
+    assert isinstance(listener, TerminalKeyListener)
+
+
+def test_linux_without_xrecord_falls_back_to_terminal(monkeypatch):
+    """A reachable DISPLAY alone is insufficient: pynput also requires X RECORD."""
+    _set_platform(monkeypatch, "Linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+    monkeypatch.setattr(ki, "_pynput_available", True)
+    monkeypatch.setattr(ki, "_x11_record_available", lambda: False)
+    _set_tty(monkeypatch, is_tty=True)
+    monkeypatch.setattr(TerminalKeyListener, "start", lambda self: None)
+
+    def unexpected_listener(*, on_press):
+        raise AssertionError("pynput must not start without the X RECORD extension")
+
+    monkeypatch.setattr(ki, "keyboard", SimpleNamespace(Listener=unexpected_listener))
+
+    listener = create_key_listener(lambda name: None)
+
+    assert isinstance(listener, TerminalKeyListener)
+
+
+class _StartupDeadPynputListener:
+    """Match pynput after record_create_context fails: running stays true, thread is dead."""
+
+    running = True
+
+    def __init__(self):
+        self.start_called = False
+        self.stop_called = False
+
+    def start(self):
+        self.start_called = True
+
+    def is_alive(self):
+        return False
+
+    def stop(self):
+        self.stop_called = True
+        raise AssertionError("stopping this pynput state would block forever in listener.wait()")
+
+
+def _install_startup_dead_pynput(monkeypatch):
+    dead = _StartupDeadPynputListener()
+    monkeypatch.setattr(ki, "pynput_can_capture", lambda: True)
+    monkeypatch.setattr(ki, "_x11_record_available", lambda: True)
+    monkeypatch.setattr(ki, "pynput_listener_is_trusted", lambda listener: True)
+    monkeypatch.setattr(ki, "keyboard", SimpleNamespace(Listener=lambda **kwargs: dead))
+    return dead
+
+
+def test_startup_dead_pynput_falls_back_to_terminal(monkeypatch):
+    dead = _install_startup_dead_pynput(monkeypatch)
+    _set_tty(monkeypatch, is_tty=True)
+    monkeypatch.setattr(TerminalKeyListener, "start", lambda self: None)
+
+    listener = create_key_listener(lambda name: None)
+
+    assert dead.start_called is True
+    assert dead.stop_called is False
+    assert isinstance(listener, TerminalKeyListener)
+
+
+def test_startup_dead_pynput_returns_none_without_terminal(monkeypatch):
+    dead = _install_startup_dead_pynput(monkeypatch)
+    _set_tty(monkeypatch, is_tty=False)
+
+    listener = create_key_listener(lambda name: None)
+
+    assert dead.start_called is True
+    assert dead.stop_called is False
+    assert listener is None
+
+
+def test_key_listener_liveness_uses_thread_state_not_stale_running_flag():
+    dead = _StartupDeadPynputListener()
+
+    assert dead.running is True
+    assert key_listener_is_alive(dead) is False
+    assert key_listener_is_alive(None) is False
+
+
+@pytest.mark.skipif(not ki._TERMIOS_AVAILABLE, reason="requires a POSIX pseudo-terminal")
+def test_terminal_listener_reads_space_and_tab_from_real_pty(monkeypatch):
+    """Exercise fileno/termios/select/os.read/thread dispatch instead of calling _on_key directly."""
+    master_fd, slave_fd = pty.openpty()
+    slave = os.fdopen(slave_fd, "r", encoding="utf-8", buffering=1)
+    monkeypatch.setattr(sys, "stdin", slave)
+    received = []
+    complete = threading.Event()
+
+    def on_key(name):
+        received.append(name)
+        if received == ["space", "tab"]:
+            complete.set()
+
+    listener = TerminalKeyListener(on_key)
+    try:
+        listener.start()
+        assert key_listener_is_alive(listener) is True
+        os.write(master_fd, b" \t")
+        assert complete.wait(timeout=1.0), received
+    finally:
+        listener.stop()
+        slave.close()
+        os.close(master_fd)
+
+    assert received == ["space", "tab"]
+    assert key_listener_is_alive(listener) is False

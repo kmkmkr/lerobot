@@ -85,6 +85,75 @@ def test_dagger_config_defaults():
     assert cfg.num_episodes is None
     assert cfg.record_autonomous is False
     assert cfg.input_device == "keyboard"
+    assert cfg.resume_blend_duration_s == 2.0
+    assert cfg.max_action_velocity is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"resume_blend_duration_s": float("nan")},
+        {"resume_blend_duration_s": float("inf")},
+        {"max_action_velocity": float("nan")},
+        {"max_action_velocity": float("inf")},
+    ],
+)
+def test_dagger_safety_limits_must_be_finite(kwargs):
+    from lerobot.rollout import DAggerStrategyConfig
+
+    with pytest.raises(ValueError, match="must be finite"):
+        DAggerStrategyConfig(**kwargs)
+
+
+def test_dagger_corrections_only_forces_non_streaming_encoding():
+    from lerobot.rollout import DAggerStrategyConfig, RolloutConfig
+
+    dataset = MagicMock()
+    dataset.repo_id = "local/test"
+    dataset.streaming_encoding = True
+    dataset.video = True
+    dataset.video_encoding_batch_size = 1
+    dataset.num_episodes = 1
+    dataset.single_task = "task"
+    policy = MagicMock()
+    policy.device = "cpu"
+
+    RolloutConfig(
+        robot=MagicMock(),
+        teleop=MagicMock(),
+        policy=policy,
+        strategy=DAggerStrategyConfig(num_episodes=1),
+        dataset=dataset,
+        device="cpu",
+    )
+
+    assert dataset.streaming_encoding is False
+    assert dataset.video_encoding_batch_size == 2
+
+
+@pytest.mark.parametrize("robot_type", ["openarm_follower", "bi_openarm_follower"])
+def test_openarm_continuous_dagger_fails_before_hardware_connection(robot_type):
+    from lerobot.rollout import DAggerStrategyConfig, RolloutConfig
+
+    dataset = MagicMock()
+    dataset.repo_id = "local/test"
+    dataset.streaming_encoding = True
+    dataset.num_episodes = 1
+    dataset.single_task = "task"
+    policy = MagicMock()
+    policy.device = "cpu"
+    robot = MagicMock()
+    robot.type = robot_type
+
+    with pytest.raises(ValueError, match="record_autonomous=False"):
+        RolloutConfig(
+            robot=robot,
+            teleop=MagicMock(),
+            policy=policy,
+            strategy=DAggerStrategyConfig(num_episodes=1, record_autonomous=True),
+            dataset=dataset,
+            device="cpu",
+        )
 
 
 def test_inference_config_types():
@@ -413,7 +482,7 @@ def test_dagger_openarm_transitions_keep_bilateral_feedback_torque_enabled():
     teleop.enable_torque.assert_not_called()
     engine.pause.assert_called_once_with()
     engine.reset.assert_called_once_with()
-    engine.resume.assert_called_once_with()
+    engine.resume.assert_not_called()
     interpolator.reset.assert_called_once_with()
 
 
@@ -485,9 +554,7 @@ def test_dagger_intervention_connects_teleop_before_coordinated_startup():
     robot.prepare_for_intervention_deployment.side_effect = lambda teleop: events.append(
         "robot.prepare_intervention"
     )
-    robot.get_observation.side_effect = lambda: events.append("robot.get_observation") or {
-        "joint_1.pos": 1.0
-    }
+    robot.get_observation.side_effect = lambda: events.append("robot.get_observation") or {"joint_1.pos": 1.0}
     teleop = MagicMock()
     teleop.connect.side_effect = lambda: events.append("teleop.connect")
     cfg = MagicMock()
@@ -642,3 +709,351 @@ def test_teardown_disconnects_when_robot_specific_return_fails():
 
     robot.disconnect.assert_called_once_with()
     teleop.disconnect.assert_called_once_with()
+
+
+def test_context_build_failure_after_connect_secures_and_disconnects_hardware():
+    import lerobot.rollout.context as context_module
+
+    robot = MagicMock()
+    robot.is_connected = True
+    teleop = MagicMock()
+    teleop.is_connected = True
+
+    @context_module._cleanup_connected_hardware_on_build_error
+    def fail_after_connect():
+        context_module._pending_context_hardware.set((robot, teleop))
+        raise RuntimeError("dataset setup failed")
+
+    with pytest.raises(RuntimeError, match="dataset setup failed"):
+        fail_after_connect()
+
+    robot.secure_intervention_after_fault.assert_called_once_with(teleop)
+    teleop.disconnect.assert_called_once_with()
+    robot.disconnect.assert_called_once_with()
+
+
+def test_task_ready_observation_failure_secures_intervention_before_disconnect():
+    from types import SimpleNamespace
+
+    import lerobot.rollout.context as context_module
+    from lerobot.rollout import DAggerStrategyConfig
+
+    calls: list[str] = []
+    robot = MagicMock()
+    robot.name = "bi_openarm_follower"
+    robot.is_connected = True
+    robot.get_observation.side_effect = RuntimeError("initial observation failed")
+    robot.secure_intervention_after_fault.side_effect = lambda _teleop: calls.append("secure")
+    robot.disconnect.side_effect = lambda: calls.append("robot.disconnect")
+    teleop = MagicMock()
+    teleop.is_connected = True
+    teleop.disconnect.side_effect = lambda: calls.append("teleop.disconnect")
+    cfg = SimpleNamespace(
+        robot=SimpleNamespace(type="bi_openarm_follower"),
+        strategy=DAggerStrategyConfig(num_episodes=1),
+        teleop=SimpleNamespace(type="bi_openarm_leader"),
+    )
+
+    with (
+        patch.object(context_module, "make_robot_from_config", return_value=robot),
+        patch.object(context_module, "make_teleoperator_from_config", return_value=teleop),
+        pytest.raises(RuntimeError, match="initial observation failed"),
+    ):
+        context_module._connect_rollout_hardware(cfg)
+
+    robot.prepare_for_intervention_deployment.assert_called_once_with(teleop)
+    assert calls == ["secure", "teleop.disconnect", "robot.disconnect"]
+
+
+def test_context_connect_system_exit_disconnects_a_partially_connected_can_bus():
+    from types import SimpleNamespace
+
+    import lerobot.rollout.context as context_module
+    from lerobot.rollout import BaseStrategyConfig
+
+    robot = MagicMock()
+    robot.name = "partial-robot"
+    robot.connect.side_effect = SystemExit("interrupted during camera startup")
+    robot.is_connected = False
+    robot.bus.is_connected = True
+    robot.cameras = {}
+    cfg = SimpleNamespace(
+        robot=SimpleNamespace(type="partial-robot"),
+        strategy=BaseStrategyConfig(),
+        teleop=None,
+    )
+
+    with (
+        patch.object(context_module, "make_robot_from_config", return_value=robot),
+        pytest.raises(SystemExit, match="camera startup"),
+    ):
+        context_module._connect_rollout_hardware(cfg)
+
+    robot.disconnect.assert_called_once_with()
+
+
+def test_bimanual_disconnect_cleans_live_can_when_full_arm_state_is_false():
+    from types import SimpleNamespace
+
+    from lerobot.utils.bimanual import BimanualMixin
+
+    device = object.__new__(BimanualMixin)
+    left_disconnect = MagicMock()
+    right_disconnect = MagicMock()
+    device.left_arm = SimpleNamespace(
+        is_connected=False,
+        bus=SimpleNamespace(is_connected=True),
+        cameras={},
+        disconnect=left_disconnect,
+    )
+    device.right_arm = SimpleNamespace(
+        is_connected=False,
+        bus=SimpleNamespace(is_connected=False),
+        cameras={},
+        disconnect=right_disconnect,
+    )
+
+    assert device.any_arm_connected
+    device.disconnect()
+
+    left_disconnect.assert_called_once_with()
+    right_disconnect.assert_not_called()
+
+
+def test_bimanual_live_connection_check_does_not_swallow_keyboard_interrupt():
+    from types import SimpleNamespace
+
+    from lerobot.utils.bimanual import BimanualMixin
+
+    class InterruptingArm:
+        bus = SimpleNamespace(is_connected=True)
+        cameras = {}
+
+        @property
+        def is_connected(self):
+            raise KeyboardInterrupt("connection check interrupted")
+
+    with pytest.raises(KeyboardInterrupt, match="connection check interrupted"):
+        BimanualMixin._arm_has_live_connection(InterruptingArm())
+
+
+def test_keyboard_interrupt_with_teardown_failure_surfaces_teardown_error():
+    from types import SimpleNamespace
+
+    import lerobot.scripts.lerobot_rollout as rollout_module
+
+    strategy = MagicMock()
+    strategy.run.side_effect = KeyboardInterrupt()
+    strategy.teardown.side_effect = RuntimeError("hardware teardown failed")
+    ctx = SimpleNamespace(hardware=SimpleNamespace(control_fault=None))
+    cfg = SimpleNamespace(
+        display_data=False,
+        strategy=SimpleNamespace(type="dagger"),
+        robot=SimpleNamespace(type="bi_openarm_follower"),
+        fps=30.0,
+        duration=0.0,
+    )
+
+    with (
+        patch.object(rollout_module, "init_logging"),
+        patch.object(
+            rollout_module,
+            "ProcessSignalHandler",
+            return_value=SimpleNamespace(shutdown_event=MagicMock()),
+        ),
+        patch.object(rollout_module, "create_strategy", return_value=strategy),
+        patch.object(rollout_module, "build_rollout_context", return_value=ctx),
+        pytest.raises(RuntimeError, match="hardware teardown failed"),
+    ):
+        rollout_module.rollout.__wrapped__(cfg)
+
+    assert isinstance(ctx.hardware.control_fault, KeyboardInterrupt)
+
+
+def test_interrupt_during_post_build_logging_still_tears_down_connected_context():
+    from types import SimpleNamespace
+
+    import lerobot.scripts.lerobot_rollout as rollout_module
+
+    strategy = MagicMock()
+    hardware = SimpleNamespace(control_fault=None, teardown_complete=False)
+    ctx = SimpleNamespace(hardware=hardware)
+    cfg = SimpleNamespace(
+        display_data=False,
+        strategy=SimpleNamespace(type="dagger"),
+        robot=SimpleNamespace(type="bi_openarm_follower"),
+        fps=30.0,
+        duration=0.0,
+    )
+
+    def interrupt_after_context(message, *_args, **_kwargs):
+        if message == "Rollout strategy: %s":
+            raise KeyboardInterrupt("post-build interrupt")
+
+    def complete_teardown(_ctx):
+        hardware.teardown_complete = True
+
+    strategy.teardown.side_effect = complete_teardown
+
+    with (
+        patch.object(rollout_module, "init_logging"),
+        patch.object(
+            rollout_module,
+            "ProcessSignalHandler",
+            return_value=SimpleNamespace(shutdown_event=MagicMock()),
+        ),
+        patch.object(rollout_module, "create_strategy", return_value=strategy),
+        patch.object(rollout_module, "build_rollout_context", return_value=ctx),
+        patch.object(rollout_module.logger, "info", side_effect=interrupt_after_context),
+        pytest.raises(KeyboardInterrupt, match="post-build interrupt") as exc_info,
+    ):
+        rollout_module.rollout.__wrapped__(cfg)
+
+    assert hardware.control_fault is exc_info.value
+    strategy.setup.assert_not_called()
+    strategy.teardown.assert_called_once_with(ctx)
+
+
+def test_interrupt_after_context_adoption_uses_handoff_for_teardown():
+    from types import SimpleNamespace
+
+    import lerobot.scripts.lerobot_rollout as rollout_module
+
+    strategy = MagicMock()
+    hardware = SimpleNamespace(control_fault=None, teardown_complete=False)
+    ctx = SimpleNamespace(hardware=hardware)
+    cfg = SimpleNamespace(
+        display_data=False,
+        strategy=SimpleNamespace(type="dagger"),
+        robot=SimpleNamespace(type="bi_openarm_follower"),
+        fps=30.0,
+        duration=0.0,
+    )
+
+    def build_context(_cfg, _shutdown_event, *, context_ready_callback=None):
+        assert context_ready_callback is not None
+        context_ready_callback(ctx)
+        raise KeyboardInterrupt("context handoff interrupt")
+
+    def complete_teardown(_ctx):
+        hardware.teardown_complete = True
+
+    strategy.teardown.side_effect = complete_teardown
+
+    with (
+        patch.object(rollout_module, "init_logging"),
+        patch.object(
+            rollout_module,
+            "ProcessSignalHandler",
+            return_value=SimpleNamespace(shutdown_event=MagicMock()),
+        ),
+        patch.object(rollout_module, "create_strategy", return_value=strategy),
+        patch.object(rollout_module, "build_rollout_context", side_effect=build_context),
+        pytest.raises(KeyboardInterrupt, match="context handoff interrupt") as exc_info,
+    ):
+        rollout_module.rollout.__wrapped__(cfg)
+
+    assert hardware.control_fault is exc_info.value
+    strategy.setup.assert_not_called()
+    strategy.teardown.assert_called_once_with(ctx)
+
+
+def test_interrupt_immediately_before_teardown_call_still_completes_hardware_cleanup():
+    from types import SimpleNamespace
+
+    import lerobot.scripts.lerobot_rollout as rollout_module
+
+    hardware = SimpleNamespace(control_fault=None, teardown_complete=False)
+    ctx = SimpleNamespace(hardware=hardware)
+    interrupt = KeyboardInterrupt("pre-teardown interrupt")
+
+    class InterruptBeforeTeardownStrategy:
+        def __init__(self):
+            self.teardown_accesses = 0
+
+        def setup(self, _ctx):
+            pass
+
+        def run(self, _ctx):
+            pass
+
+        @property
+        def teardown(self):
+            self.teardown_accesses += 1
+            if self.teardown_accesses == 1:
+                raise interrupt
+
+            def complete_teardown(_ctx):
+                hardware.teardown_complete = True
+
+            return complete_teardown
+
+    strategy = InterruptBeforeTeardownStrategy()
+    cfg = SimpleNamespace(
+        display_data=False,
+        strategy=SimpleNamespace(type="dagger"),
+        robot=SimpleNamespace(type="bi_openarm_follower"),
+        fps=30.0,
+        duration=0.0,
+    )
+
+    with (
+        patch.object(rollout_module, "init_logging"),
+        patch.object(
+            rollout_module,
+            "ProcessSignalHandler",
+            return_value=SimpleNamespace(shutdown_event=MagicMock()),
+        ),
+        patch.object(rollout_module, "create_strategy", return_value=strategy),
+        patch.object(rollout_module, "build_rollout_context", return_value=ctx),
+        pytest.raises(KeyboardInterrupt, match="pre-teardown interrupt") as exc_info,
+    ):
+        rollout_module.rollout.__wrapped__(cfg)
+
+    assert exc_info.value is interrupt
+    assert hardware.control_fault is interrupt
+    assert hardware.teardown_complete
+    assert strategy.teardown_accesses == 2
+
+
+def test_interrupt_during_teardown_retries_in_fault_mode_until_hardware_is_complete():
+    from types import SimpleNamespace
+
+    import lerobot.scripts.lerobot_rollout as rollout_module
+
+    strategy = MagicMock()
+    hardware = SimpleNamespace(control_fault=None, teardown_complete=False)
+    ctx = SimpleNamespace(hardware=hardware)
+    cfg = SimpleNamespace(
+        display_data=False,
+        strategy=SimpleNamespace(type="dagger"),
+        robot=SimpleNamespace(type="bi_openarm_follower"),
+        fps=30.0,
+        duration=0.0,
+    )
+    interrupt = KeyboardInterrupt("teardown interrupt")
+
+    def teardown_side_effect(_ctx):
+        if strategy.teardown.call_count == 1:
+            raise interrupt
+        hardware.teardown_complete = True
+
+    strategy.teardown.side_effect = teardown_side_effect
+
+    with (
+        patch.object(rollout_module, "init_logging"),
+        patch.object(
+            rollout_module,
+            "ProcessSignalHandler",
+            return_value=SimpleNamespace(shutdown_event=MagicMock()),
+        ),
+        patch.object(rollout_module, "create_strategy", return_value=strategy),
+        patch.object(rollout_module, "build_rollout_context", return_value=ctx),
+        pytest.raises(KeyboardInterrupt, match="teardown interrupt") as exc_info,
+    ):
+        rollout_module.rollout.__wrapped__(cfg)
+
+    assert exc_info.value is interrupt
+    assert hardware.control_fault is interrupt
+    assert hardware.teardown_complete
+    assert strategy.teardown.call_count == 2

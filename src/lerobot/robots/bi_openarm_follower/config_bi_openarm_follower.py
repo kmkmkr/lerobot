@@ -55,7 +55,9 @@ class BiOpenArmFollowerConfig(RobotConfig):
     shutdown_zero_transition_s: float = 1.0
     shutdown_task_pose_warn_deg: float = math.degrees(0.5)
     deployment_tracking_error_deg: float = math.degrees(0.35)
-    deployment_start_limit_tolerance_deg: float = 1.0
+    # Covers the observed OpenArm gripper sensor overshoot (+1.257 deg) while
+    # still treating larger deviations from a physical limit as a fault.
+    deployment_start_limit_tolerance_deg: float = 1.5
     hold_position_on_shutdown_error: bool = True
 
     def __post_init__(self) -> None:

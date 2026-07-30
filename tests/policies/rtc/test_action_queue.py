@@ -222,6 +222,27 @@ def test_get_action_index_after_consumption(action_queue_rtc_enabled, sample_act
     assert action_queue_rtc_enabled.get_action_index() == 3
 
 
+def test_snapshot_for_inference_is_aligned_and_cloned(action_queue_rtc_enabled, sample_actions):
+    """Index and model/robot prefixes are captured atomically."""
+    action_queue_rtc_enabled.merge(sample_actions["original"], sample_actions["processed"], real_delay=0)
+    for _ in range(3):
+        action_queue_rtc_enabled.get()
+
+    remaining, index, original_left, processed_left = action_queue_rtc_enabled.snapshot_for_inference()
+
+    assert remaining == 47
+    assert index == 3
+    torch.testing.assert_close(original_left, sample_actions["original"][3:])
+    torch.testing.assert_close(processed_left, sample_actions["processed"][3:])
+
+    original_left.zero_()
+    processed_left.zero_()
+    torch.testing.assert_close(action_queue_rtc_enabled.get_left_over(), sample_actions["original"][3:])
+    torch.testing.assert_close(
+        action_queue_rtc_enabled.get_processed_left_over(), sample_actions["processed"][3:]
+    )
+
+
 # get_left_over() tests
 
 
@@ -457,8 +478,28 @@ def test_merge_validates_delay_consistency(action_queue_rtc_enabled, sample_acti
         action_index_before_inference=0,
     )
 
-    # Check warning was logged
+    # The queue must use the five actions actually consumed, not the
+    # three steps estimated from wall-clock latency.
     assert "Indexes diff is not equal to real delay" in caplog.text
+    assert action_queue_rtc_enabled.qsize() == 45
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][5])
+
+
+def test_merge_uses_index_zero_when_no_action_was_consumed(action_queue_rtc_enabled, sample_actions, caplog):
+    """The first post-reset chunk starts at index zero despite inference latency."""
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=4,
+        action_index_before_inference=0,
+    )
+
+    assert "Indexes diff is not equal to real delay" in caplog.text
+    assert action_queue_rtc_enabled.qsize() == 50
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][0])
 
 
 def test_merge_no_warning_when_delays_match(action_queue_rtc_enabled, sample_actions, caplog):
@@ -800,9 +841,11 @@ def test_typical_rtc_workflow(action_queue_rtc_enabled, sample_actions):
         action_index_before_inference=action_index_before,
     )
 
-    # Queue should be replaced, minus delay
-    assert action_queue_rtc_enabled.qsize() == 45
+    # No actions were consumed after the inference snapshot, so the
+    # wall-clock estimate must not skip the beginning of the new chunk.
+    assert action_queue_rtc_enabled.qsize() == 50
     assert action_queue_rtc_enabled.get_action_index() == 0
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][0])
 
 
 def test_typical_non_rtc_workflow(action_queue_rtc_disabled, sample_actions):

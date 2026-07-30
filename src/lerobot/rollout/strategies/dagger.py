@@ -53,6 +53,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import logging
+import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Event, Lock
@@ -65,15 +66,15 @@ from lerobot.common.control_utils import (
     teleop_smooth_move_to,
     teleop_supports_feedback,
 )
-from lerobot.datasets import VideoEncodingManager
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
-from lerobot.utils.keyboard_input import create_key_listener
+from lerobot.utils.keyboard_input import create_key_listener, key_listener_is_alive
 from lerobot.utils.pedal import start_pedal_listener
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
 
+from ..async_dataset import AsyncEpisodeSaver
 from ..configs import DAggerKeyboardConfig, DAggerPedalConfig, DAggerStrategyConfig
 from ..context import RolloutContext
 from .core import RolloutStrategy, estimate_max_episode_seconds, safe_push_to_hub, send_next_action
@@ -90,6 +91,93 @@ def _send_continuous_feedback(teleop, observation: dict[str, Any]) -> None:
     """Maintain feedback control for teleoperators such as the OpenArm leader."""
     if _teleop_requires_continuous_feedback(teleop):
         teleop.send_feedback(observation)
+
+
+class PolicyActionRateLimiter:
+    """Blend and velocity-limit policy targets after autonomous handover."""
+
+    def __init__(
+        self,
+        blend_duration_s: float,
+        max_velocity: float | None,
+        *,
+        clock=time.perf_counter,
+    ) -> None:
+        self._blend_duration_s = blend_duration_s
+        self._max_velocity = max_velocity
+        self._clock = clock
+        self._anchor: dict[str, float] = {}
+        self._last: dict[str, float] = {}
+        self._started_at: float | None = None
+        self._last_time: float | None = None
+
+    def reset(self, observation: dict[str, Any], action_keys: list[str]) -> None:
+        """Anchor a new handover to a fresh measured observation."""
+        anchor: dict[str, float] = {}
+        for key in action_keys:
+            if key not in observation:
+                continue
+            value_array = np.asarray(observation[key])
+            if value_array.size != 1:
+                continue
+            value = float(value_array.item())
+            if np.isfinite(value):
+                anchor[key] = value
+
+        missing_keys = [key for key in action_keys if key not in anchor]
+        if (self._blend_duration_s > 0 or self._max_velocity is not None) and missing_keys:
+            raise RuntimeError(
+                "DAgger safe autonomous handover requires a finite measured value for every "
+                f"policy action key; missing or invalid: {missing_keys}"
+            )
+
+        now = self._clock()
+        self._anchor = anchor
+        self._last = anchor.copy()
+        self._started_at = now
+        self._last_time = now
+
+    def mark_hold(self) -> None:
+        """Freeze blend progress and velocity time while no policy target exists."""
+        if self._last_time is not None and self._started_at is not None:
+            now = self._clock()
+            self._started_at += max(0.0, now - self._last_time)
+            self._last_time = now
+
+    def __call__(self, action: dict[str, float]) -> dict[str, float]:
+        if self._started_at is None or self._last_time is None:
+            return dict(action)
+
+        now = self._clock()
+        elapsed = max(0.0, now - self._started_at)
+        dt = max(0.0, now - self._last_time)
+        if self._blend_duration_s == 0:
+            blend = 1.0
+        else:
+            ratio = min(1.0, elapsed / self._blend_duration_s)
+            blend = ratio * ratio * (3.0 - 2.0 * ratio)
+
+        limited = {key: float(value) for key, value in action.items()}
+        for key, value in limited.items():
+            if not np.isfinite(value):
+                raise ValueError(f"DAgger policy produced a non-finite target for {key}: {value}")
+
+        missing_targets = [key for key in self._anchor if key not in limited]
+        if missing_targets:
+            raise ValueError(f"DAgger policy action is missing anchored targets: {missing_targets}")
+
+        for key, anchor in self._anchor.items():
+            target = limited[key]
+            target = anchor + blend * (target - anchor)
+            if self._max_velocity is not None:
+                max_delta = self._max_velocity * dt
+                previous = self._last[key]
+                target = min(max(target, previous - max_delta), previous + max_delta)
+            limited[key] = target
+            self._last[key] = target
+
+        self._last_time = now
+        return limited
 
 
 # ---------------------------------------------------------------------------
@@ -153,12 +241,16 @@ class DAggerEvents:
             if (self._phase, event) in _DAGGER_TRANSITIONS:
                 self._pending_transition = event
 
-    def consume_transition(self) -> tuple[DAggerPhase, DAggerPhase] | None:
+    def consume_transition(
+        self, *, paused_transition_ready: bool = True
+    ) -> tuple[DAggerPhase, DAggerPhase] | None:
         """Consume a pending transition (called from main loop)."""
         with self._lock:
             if self._pending_transition is None:
                 return None
             key = (self._phase, self._pending_transition)
+            if self._phase == DAggerPhase.PAUSED and not paused_transition_ready:
+                return None
             self._pending_transition = None
             new_phase = _DAGGER_TRANSITIONS.get(key)
             if new_phase is None:
@@ -183,8 +275,9 @@ class DAggerEvents:
 def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
     """Initialise a keyboard listener for DAgger's 3 controls.
 
-    Backend selection (pynput on X11 / trusted-macOS / Windows, a terminal reader on
-    Wayland / headless TTY) is delegated to :func:`create_key_listener`. Returns the
+    Backend selection is delegated to :func:`create_key_listener`. DAgger prefers the
+    controlling POSIX terminal even when X11 is available, then falls back to a usable
+    pynput backend on platforms without one. Returns the
     listener (exposing ``stop()``) or ``None`` when no keyboard backend is usable.
     """
     # Map config key names to DAgger event names.
@@ -206,6 +299,7 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
 
     return create_key_listener(
         dispatch,
+        prefer_terminal=True,
         controls_help=(
             f"pause_resume='{cfg.pause_resume}', correction='{cfg.correction}', "
             f"upload='{cfg.upload}', ESC=stop"
@@ -265,6 +359,12 @@ class DAggerStrategy(RolloutStrategy):
         self._needs_push = Event()
         self._episode_lock = Lock()
 
+        self._episode_saver: AsyncEpisodeSaver | None = None
+        self._rate_limiter = PolicyActionRateLimiter(
+            blend_duration_s=config.resume_blend_duration_s,
+            max_velocity=config.max_action_velocity,
+        )
+
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine and input device listener."""
         self._init_engine(ctx)
@@ -274,10 +374,22 @@ class DAggerStrategy(RolloutStrategy):
             ctx.data.dataset_features, ctx.runtime.cfg.fps, target_size_mb=target_mb
         )
 
+        if not self.config.record_autonomous:
+            if ctx.data.dataset is None:
+                raise RuntimeError("DAgger corrections-only mode requires a writable dataset")
+            self._episode_saver = AsyncEpisodeSaver(
+                ctx.data.dataset, dataset_lock=self._episode_lock, thread_name_prefix="dagger-save"
+            )
+
         if self.config.input_device == "keyboard":
             self._listener = _init_dagger_keyboard(self._events, self.config.keyboard)
+            if self._listener is None:
+                raise RuntimeError("DAgger cannot start because no keyboard input backend is available")
+            self._raise_if_keyboard_listener_failed()
         else:
             self._pedal_thread = _init_dagger_pedal(self._events, self.config.pedal)
+            if self._pedal_thread is None:
+                raise RuntimeError("DAgger cannot start because no pedal input backend is available")
 
         record_mode = "all frames (sentry-like)" if self.config.record_autonomous else "corrections only"
         logger.info(
@@ -295,39 +407,270 @@ class DAggerStrategy(RolloutStrategy):
         else:
             self._run_corrections_only(ctx)
 
+    def _raise_if_keyboard_listener_failed(self) -> None:
+        """Stop control if the configured keyboard backend is no longer receiving input."""
+        if self.config.input_device != "keyboard":
+            return
+        if self._listener is not None and key_listener_is_alive(self._listener):
+            return
+        raise RuntimeError(
+            "DAgger keyboard input listener stopped unexpectedly; "
+            "stopping control before sending additional robot commands"
+        )
+
+    def _resume_from_fresh_observation(
+        self,
+        ctx: RolloutContext,
+        observation: dict[str, Any],
+    ) -> dict:
+        """Publish current state before allowing the reset engine to run."""
+        self._cached_obs_processed = None
+        obs_processed = self._process_observation_and_notify(ctx.processors, observation)
+        self._rate_limiter.reset(
+            observation,
+            list(ctx.data.ordered_action_keys),
+        )
+        self._engine.resume()
+        logger.info("Autonomous inference resumed from a fresh measured observation")
+        return obs_processed
+
+    @staticmethod
+    def _hold_action(action: dict[str, Any]) -> dict[str, Any]:
+        """Hold position without replaying stale velocity or torque targets."""
+        return {key: 0.0 if key.endswith((".vel", ".torque")) else value for key, value in action.items()}
+
+    @classmethod
+    def _measured_hold_action(
+        cls,
+        previous_action: dict[str, Any] | None,
+        observation: dict[str, Any],
+        action_keys: list[str],
+    ) -> dict[str, Any]:
+        """Snapshot a finite measured position hold at a PAUSED transition."""
+        hold = cls._hold_action(previous_action or {})
+        missing: list[str] = []
+        for key in action_keys:
+            if not key.endswith(".pos"):
+                continue
+            if key not in observation:
+                missing.append(key)
+                continue
+            value_array = np.asarray(observation[key])
+            if value_array.size != 1:
+                missing.append(key)
+                continue
+            value = float(value_array.item())
+            if not np.isfinite(value):
+                missing.append(key)
+                continue
+            hold[key] = value
+
+        if missing:
+            raise RuntimeError(
+                f"DAgger cannot establish a measured PAUSED hold; missing or invalid positions: {missing}"
+            )
+        return hold
+
+    @staticmethod
+    def _raise_if_engine_failed(engine, ctx: RolloutContext) -> None:
+        """Turn a background inference-thread failure into a control fault."""
+        if not engine.failed:
+            return
+        error = RuntimeError("The inference engine failed in its background thread")
+        ctx.hardware.control_fault = error
+        raise error
+
+    @staticmethod
+    def _raise_if_shutdown_requested(ctx: RolloutContext) -> None:
+        """Treat an event-only shutdown as a control fault, never an orderly return."""
+        if not ctx.runtime.shutdown_event.is_set():
+            return
+        error = KeyboardInterrupt("Rollout interrupted by a shutdown signal")
+        ctx.hardware.control_fault = error
+        raise error
+
+    @staticmethod
+    def _record_teardown_error(
+        ctx: RolloutContext,
+        teardown_errors: list[BaseException],
+        error: BaseException,
+        phase: str,
+    ) -> None:
+        """Promote every teardown failure to a no-return control fault."""
+        existing_fault = ctx.hardware.control_fault
+        if existing_fault is None:
+            ctx.hardware.control_fault = error
+        elif existing_fault is not error:
+            existing_fault.add_note(f"Additional {phase} teardown error: {error!r}")
+        if not any(recorded is error for recorded in teardown_errors):
+            teardown_errors.append(error)
+
+    @staticmethod
+    def _promote_shutdown_signal(ctx: RolloutContext) -> None:
+        """Latch an event-only signal before any shutdown motion is considered."""
+        shutdown_event = getattr(ctx.runtime, "shutdown_event", None)
+        if shutdown_event is not None and shutdown_event.is_set() and ctx.hardware.control_fault is None:
+            ctx.hardware.control_fault = KeyboardInterrupt("Rollout interrupted by a shutdown signal")
+            logger.warning("Shutdown signal detected; prohibiting coordinated return motion")
+
+    def _teardown_hardware_best_effort(
+        self,
+        ctx: RolloutContext,
+        teardown_errors: list[BaseException],
+    ) -> None:
+        """Retry once in fault mode if teardown is interrupted before completion."""
+        for attempt in range(1, 3):
+            try:
+                # Re-check immediately before each attempt. A signal may have
+                # arrived after teardown began but before hardware was reached.
+                self._promote_shutdown_signal(ctx)
+                self._teardown_hardware(
+                    ctx.hardware,
+                    return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
+                )
+            except BaseException as error:
+                self._record_teardown_error(
+                    ctx,
+                    teardown_errors,
+                    error,
+                    f"hardware attempt {attempt}",
+                )
+                logger.exception("Hardware teardown attempt %d failed", attempt)
+                if attempt == 1:
+                    # Core teardown marks completion in its innermost finally.
+                    # Clear it because an asynchronous BaseException may have
+                    # interrupted teleoperator disconnect just before that mark.
+                    ctx.hardware.teardown_complete = False
+                    logger.critical("Retrying hardware teardown in no-return fault mode")
+                    continue
+            break
+
+        if not bool(getattr(ctx.hardware, "teardown_complete", False)):
+            error = RuntimeError(
+                "Hardware teardown remains incomplete after fault-mode retries; "
+                "dataset persistence and finalization are prohibited"
+            )
+            self._record_teardown_error(
+                ctx,
+                teardown_errors,
+                error,
+                "hardware completion",
+            )
+            if len(teardown_errors) > 1:
+                raise error from teardown_errors[-2]
+            raise error
+
     def teardown(self, ctx: RolloutContext) -> None:
         """Stop listeners, finalise the dataset, and disconnect hardware."""
+        teardown_errors: list[BaseException] = []
         play_sounds = ctx.runtime.cfg.play_sounds
-        logger.info("Stopping DAgger recording")
-        log_say("Stopping DAgger recording", play_sounds)
+        try:
+            try:
+                logger.info("Stopping DAgger recording")
+                log_say("Stopping DAgger recording", play_sounds)
+            except BaseException as error:
+                self._record_teardown_error(ctx, teardown_errors, error, "announcement")
+                logger.exception("Failed to announce DAgger shutdown; continuing hardware teardown")
 
-        if self._listener is not None:
-            logger.info("Stopping keyboard listener")
-            self._listener.stop()
+            if self._listener is not None:
+                if key_listener_is_alive(self._listener):
+                    logger.info("Stopping keyboard listener")
+                    try:
+                        self._listener.stop()
+                    except BaseException as error:
+                        self._record_teardown_error(ctx, teardown_errors, error, "input listener")
+                        logger.exception("Failed to stop keyboard listener; continuing hardware teardown")
+                else:
+                    logger.warning("Keyboard listener is already stopped; skipping listener.stop()")
+        finally:
+            # Covers an asynchronous BaseException delivered between the guarded
+            # pre-hardware operations above. Hardware still gets a fault-mode
+            # secure/disconnect attempt before the exception can propagate.
+            active_error = sys.exception()
+            if active_error is not None:
+                self._record_teardown_error(ctx, teardown_errors, active_error, "pre-hardware")
+            self._teardown_hardware_best_effort(ctx, teardown_errors)
 
+        if self._episode_saver is not None:
+            logger.info("Waiting for pending episode persistence after hardware shutdown...")
+            saver_error: BaseException | None = None
+            save_was_pending = False
+            save_submitted = False
+            try:
+                save_was_pending = self._episode_saver.save_pending
+                if not save_was_pending and ctx.data.dataset is not None:
+                    # save_episode mutates the episode buffer. Never inspect it
+                    # concurrently with the background worker.
+                    with self._episode_saver.dataset_lock:
+                        has_pending_frames = ctx.data.dataset.has_pending_frames()
+                    if has_pending_frames:
+                        self._episode_saver.submit_save_episode()
+                        save_submitted = True
+            except BaseException as error:
+                saver_error = error
+                logger.exception("Asynchronous episode persistence failed")
+            try:
+                self._episode_saver.shutdown()
+            except BaseException as error:
+                if saver_error is None:
+                    saver_error = error
+                else:
+                    saver_error.add_note(f"Additional episode saver shutdown error: {error!r}")
+                logger.exception("Failed to shut down asynchronous episode persistence")
+            finally:
+                self._episode_saver = None
+            if saver_error is None and (save_was_pending or save_submitted):
+                self._needs_push.set()
+            if saver_error is not None:
+                self._record_teardown_error(ctx, teardown_errors, saver_error, "episode saver")
+        elif ctx.data.dataset is not None and ctx.data.dataset.has_pending_frames():
+            try:
+                with self._episode_lock:
+                    ctx.data.dataset.save_episode()
+                self._needs_push.set()
+            except BaseException as error:
+                self._record_teardown_error(ctx, teardown_errors, error, "episode save")
+                logger.exception("Failed to save final in-progress episode")
         # Flush any queued/running push cleanly
         if self._push_executor is not None:
             logger.info("Shutting down push executor (waiting for pending pushes)...")
-            self._push_executor.shutdown(wait=True)
-            self._push_executor = None
+            try:
+                self._push_executor.shutdown(wait=True)
+            except BaseException as error:
+                self._record_teardown_error(ctx, teardown_errors, error, "push executor")
+                logger.exception("Failed to shut down DAgger push executor")
+            finally:
+                self._push_executor = None
 
         if ctx.data.dataset is not None:
-            logger.info("Finalizing dataset...")
-            ctx.data.dataset.finalize()
-            if self._needs_push.is_set() and ctx.runtime.cfg.dataset and ctx.runtime.cfg.dataset.push_to_hub:
-                logger.info("Pushing final dataset to hub...")
-                if safe_push_to_hub(
-                    ctx.data.dataset,
-                    tags=ctx.runtime.cfg.dataset.tags,
-                    private=ctx.runtime.cfg.dataset.private,
+            try:
+                logger.info("Finalizing dataset...")
+                ctx.data.dataset.finalize()
+                if (
+                    not teardown_errors
+                    and ctx.hardware.control_fault is None
+                    and self._needs_push.is_set()
+                    and ctx.runtime.cfg.dataset
+                    and ctx.runtime.cfg.dataset.push_to_hub
                 ):
-                    logger.info("Dataset uploaded to hub")
-                    log_say("Dataset uploaded to hub", play_sounds)
+                    logger.info("Pushing final dataset to hub...")
+                    if safe_push_to_hub(
+                        ctx.data.dataset,
+                        tags=ctx.runtime.cfg.dataset.tags,
+                        private=ctx.runtime.cfg.dataset.private,
+                    ):
+                        logger.info("Dataset uploaded to hub")
+                        log_say("Dataset uploaded to hub", play_sounds)
+            except BaseException as error:
+                self._record_teardown_error(ctx, teardown_errors, error, "dataset finalization")
+                logger.exception("Dataset finalization or final push failed")
 
-        self._teardown_hardware(
-            ctx.hardware,
-            return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
-        )
+        if teardown_errors:
+            first_error = teardown_errors[0]
+            for additional_error in teardown_errors[1:]:
+                first_error.add_note(f"Additional teardown error: {additional_error!r}")
+            raise first_error
+
         logger.info("DAgger strategy teardown complete")
 
     # ------------------------------------------------------------------
@@ -359,7 +702,7 @@ class DAggerStrategy(RolloutStrategy):
         engine.reset()
         interpolator.reset()
         events.reset()
-        engine.resume()
+        resume_pending = True
 
         last_action: dict[str, Any] | None = None
         record_tick = 0
@@ -369,20 +712,24 @@ class DAggerStrategy(RolloutStrategy):
         episode_duration_s = self._episode_duration_s
         logger.info("DAgger continuous recording started (episode_duration=%.0fs)", episode_duration_s)
 
-        with VideoEncodingManager(dataset):
+        with contextlib.nullcontext():
             try:
                 while not events.stop_recording.is_set() and not ctx.runtime.shutdown_event.is_set():
                     loop_start = time.perf_counter()
+
+                    self._raise_if_keyboard_listener_failed()
 
                     if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
                         logger.info("Duration limit reached (%.0fs)", cfg.duration)
                         break
 
                     # Process transitions
+                    entered_paused = False
                     transition = events.consume_transition()
                     if transition is not None:
                         old_phase, new_phase = transition
-                        self._apply_transition(
+                        entered_paused = new_phase == DAggerPhase.PAUSED
+                        resume_pending = self._apply_transition(
                             old_phase,
                             new_phase,
                             engine,
@@ -390,11 +737,13 @@ class DAggerStrategy(RolloutStrategy):
                             ctx,
                             last_action,
                         )
-                        if new_phase == DAggerPhase.AUTONOMOUS:
-                            last_action = None
 
                     phase = events.phase
                     obs = robot.get_observation()
+                    if entered_paused:
+                        last_action = self._measured_hold_action(
+                            last_action, obs, list(ctx.data.ordered_action_keys)
+                        )
 
                     # Read the leader before returning follower feedback so OpenArm
                     # compensation can reuse the fresh leader state. Feedback is
@@ -429,16 +778,33 @@ class DAggerStrategy(RolloutStrategy):
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
                         if last_action:
-                            robot.send_action(last_action)
+                            robot.send_action(self._hold_action(last_action))
 
                     # --- AUTONOMOUS: policy control ---
                     else:
-                        obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                        if resume_pending:
+                            obs_processed = self._resume_from_fresh_observation(ctx, obs)
+                            resume_pending = False
+                        else:
+                            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
-                        if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
+                        warmup_was_flushed = self._warmup_flushed
+                        if self._handle_warmup(
+                            cfg.use_torch_compile,
+                            loop_start,
+                            control_interval,
+                            resume_after_reset=False,
+                        ):
+                            self._rate_limiter.mark_hold()
+                            if last_action:
+                                robot.send_action(self._hold_action(last_action))
                             continue
+                        if not warmup_was_flushed and self._warmup_flushed:
+                            obs_processed = self._resume_from_fresh_observation(ctx, obs)
 
-                        action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
+                        action_dict = send_next_action(
+                            obs_processed, obs, ctx, interpolator, action_filter=self._rate_limiter
+                        )
                         if action_dict is not None:
                             self._log_telemetry(obs_processed, action_dict, ctx.runtime)
                             last_action = ctx.processors.robot_action_processor((action_dict, obs))
@@ -453,6 +819,10 @@ class DAggerStrategy(RolloutStrategy):
                                 }
                                 dataset.add_frame(frame)
                             record_tick += 1
+                        else:
+                            self._rate_limiter.mark_hold()
+                            if last_action:
+                                robot.send_action(self._hold_action(last_action))
 
                     # Episode rotation derived from the video file-size target.
                     # Saving is deferred while a correction is ongoing so the
@@ -484,14 +854,23 @@ class DAggerStrategy(RolloutStrategy):
                             f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
                         )
 
+            except Exception as error:
+                ctx.hardware.control_fault = error
+                raise
             finally:
                 logger.info("DAgger continuous control loop ended — pausing engine")
-                engine.pause()
-                with contextlib.suppress(Exception):
-                    with self._episode_lock:
-                        dataset.save_episode()
-                    self._needs_push.set()
-                    logger.info("Final in-progress episode saved")
+                active_error = sys.exception()
+                try:
+                    engine.pause()
+                except BaseException as pause_error:
+                    if active_error is None:
+                        ctx.hardware.control_fault = pause_error
+                        raise
+                    active_error.add_note(f"Additional engine pause error: {pause_error!r}")
+                    logger.exception("Engine pause also failed; preserving the control-loop error")
+
+        self._raise_if_engine_failed(engine, ctx)
+        self._raise_if_shutdown_requested(ctx)
 
     # ------------------------------------------------------------------
     # Corrections-only mode (record_autonomous=False)
@@ -513,6 +892,9 @@ class DAggerStrategy(RolloutStrategy):
         events = self._events
         interpolator = self._interpolator
         features = ctx.data.dataset_features
+        saver = self._episode_saver
+        if saver is None:
+            raise RuntimeError("DAgger corrections-only episode saver was not initialized")
 
         control_interval = interpolator.get_control_interval(cfg.fps)
         record_stride = max(1, cfg.interpolation_multiplier)
@@ -522,7 +904,7 @@ class DAggerStrategy(RolloutStrategy):
         engine.reset()
         interpolator.reset()
         events.reset()
-        engine.resume()
+        resume_pending = True
 
         last_action: dict[str, Any] | None = None
         start_time = time.perf_counter()
@@ -532,7 +914,7 @@ class DAggerStrategy(RolloutStrategy):
             "DAgger corrections-only recording started (target: %d episodes)", self.config.num_episodes
         )
 
-        with VideoEncodingManager(dataset):
+        with contextlib.nullcontext():
             try:
                 while (
                     recorded < self.config.num_episodes
@@ -541,15 +923,26 @@ class DAggerStrategy(RolloutStrategy):
                 ):
                     loop_start = time.perf_counter()
 
+                    self._raise_if_keyboard_listener_failed()
+
                     if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
                         logger.info("Duration limit reached (%.0fs)", cfg.duration)
                         break
 
+                    # Collect a completed background result without blocking the
+                    # feedback loop. Space and Tab stay pending while saving.
+                    if saver.save_pending and not saver.save_in_progress:
+                        if saver.wait_for_pending_save():
+                            self._needs_push.set()
+                        logger.info("Previous correction persistence completed")
+
                     # Process transitions
-                    transition = events.consume_transition()
+                    entered_paused = False
+                    transition = events.consume_transition(paused_transition_ready=not saver.save_pending)
                     if transition is not None:
                         old_phase, new_phase = transition
-                        self._apply_transition(
+                        entered_paused = new_phase == DAggerPhase.PAUSED
+                        resume_pending = self._apply_transition(
                             old_phase,
                             new_phase,
                             engine,
@@ -557,21 +950,18 @@ class DAggerStrategy(RolloutStrategy):
                             ctx,
                             last_action,
                         )
-                        if new_phase == DAggerPhase.AUTONOMOUS:
-                            last_action = None
 
-                        # Correction ended -> save episode (blocking if not streaming)
+                        # Persist in the background while PAUSED hold and feedback
+                        # continue at the control-loop frequency.
                         if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
-                            with self._episode_lock:
-                                dataset.save_episode()
+                            saver.submit_save_episode()
                             recorded += 1
-                            self._needs_push.set()
                             logger.info(
-                                "Correction %d/%d saved",
+                                "Correction %d/%d queued for persistence",
                                 recorded,
                                 self.config.num_episodes,
                             )
-                            log_say(f"Correction {recorded} saved", play_sounds)
+                            log_say(f"Correction {recorded} queued", play_sounds)
 
                     # On-demand upload
                     if events.upload_requested.is_set():
@@ -581,6 +971,10 @@ class DAggerStrategy(RolloutStrategy):
 
                     phase = events.phase
                     obs = robot.get_observation()
+                    if entered_paused:
+                        last_action = self._measured_hold_action(
+                            last_action, obs, list(ctx.data.ordered_action_keys)
+                        )
 
                     # Read the leader before returning follower feedback so OpenArm
                     # compensation can reuse the fresh leader state. Feedback is
@@ -604,7 +998,7 @@ class DAggerStrategy(RolloutStrategy):
                         if record_tick % record_stride == 0:
                             obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                             action_frame = build_dataset_frame(features, processed_teleop, prefix=ACTION)
-                            dataset.add_frame(
+                            saver.add_frame(
                                 {
                                     **obs_frame,
                                     **action_frame,
@@ -617,19 +1011,40 @@ class DAggerStrategy(RolloutStrategy):
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
                         if last_action:
-                            robot.send_action(last_action)
+                            robot.send_action(self._hold_action(last_action))
 
                     # --- AUTONOMOUS: policy control (no recording) ---
                     else:
-                        obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                        if resume_pending:
+                            obs_processed = self._resume_from_fresh_observation(ctx, obs)
+                            resume_pending = False
+                        else:
+                            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
-                        if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
+                        warmup_was_flushed = self._warmup_flushed
+                        if self._handle_warmup(
+                            cfg.use_torch_compile,
+                            loop_start,
+                            control_interval,
+                            resume_after_reset=False,
+                        ):
+                            self._rate_limiter.mark_hold()
+                            if last_action:
+                                robot.send_action(self._hold_action(last_action))
                             continue
+                        if not warmup_was_flushed and self._warmup_flushed:
+                            obs_processed = self._resume_from_fresh_observation(ctx, obs)
 
-                        action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
+                        action_dict = send_next_action(
+                            obs_processed, obs, ctx, interpolator, action_filter=self._rate_limiter
+                        )
                         if action_dict is not None:
                             self._log_telemetry(obs_processed, action_dict, ctx.runtime)
                             last_action = ctx.processors.robot_action_processor((action_dict, obs))
+                        else:
+                            self._rate_limiter.mark_hold()
+                            if last_action:
+                                robot.send_action(self._hold_action(last_action))
 
                     dt = time.perf_counter() - loop_start
                     if (sleep_t := control_interval - dt) > 0:
@@ -639,14 +1054,23 @@ class DAggerStrategy(RolloutStrategy):
                             f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
                         )
 
+            except Exception as error:
+                ctx.hardware.control_fault = error
+                raise
             finally:
                 logger.info("DAgger corrections-only loop ended — pausing engine")
-                engine.pause()
-                with contextlib.suppress(Exception):
-                    with self._episode_lock:
-                        dataset.save_episode()
-                    self._needs_push.set()
-                    logger.info("Final in-progress episode saved")
+                active_error = sys.exception()
+                try:
+                    engine.pause()
+                except BaseException as pause_error:
+                    if active_error is None:
+                        ctx.hardware.control_fault = pause_error
+                        raise
+                    active_error.add_note(f"Additional engine pause error: {pause_error!r}")
+                    logger.exception("Engine pause also failed; preserving the control-loop error")
+
+        self._raise_if_engine_failed(engine, ctx)
+        self._raise_if_shutdown_requested(ctx)
 
     # ------------------------------------------------------------------
     # State-machine transition side-effects
@@ -660,7 +1084,7 @@ class DAggerStrategy(RolloutStrategy):
         interpolator,
         ctx: RolloutContext,
         prev_action: dict | None,
-    ) -> None:
+    ) -> bool:
         """Execute side-effects for a validated phase transition, including smooth handovers.
 
         AUTONOMOUS -> PAUSED (actuated teleop):
@@ -678,7 +1102,7 @@ class DAggerStrategy(RolloutStrategy):
             This will be potentially useful if cancelling the correction recording
 
         PAUSED -> AUTONOMOUS:
-            Reset and resume the inference engine.
+            Reset the inference engine; the caller resumes it only after publishing a fresh observation.
 
         Continuous-feedback teleops keep torque enabled for all transitions;
         the main loop supplies measured follower feedback in every phase.
@@ -724,46 +1148,23 @@ class DAggerStrategy(RolloutStrategy):
             logger.info("Resuming autonomous mode - resetting engine and interpolator")
             interpolator.reset()
             engine.reset()
-            engine.resume()
 
             # release teleop before resuming the policy
             if supports_feedback and not continuous_feedback:
                 teleop.disable_torque()
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Background push (shared by both modes)
     # ------------------------------------------------------------------
 
-    def _background_push(self, dataset, cfg) -> None:
-        """Queue a Hub push on the single-worker executor.
+    def _background_push(self, _dataset, _cfg) -> None:
+        """Defer upload until hardware is down and dataset writers are finalized.
 
-        The executor's max_workers=1 guarantees at most one push runs at
-        a time; submitted tasks are queued rather than dropped.  Pushes
-        are blocked while the operator is mid-correction to avoid
-        uploading a partially-recorded episode.
+        Network upload and open Parquet/video writers must never contend with
+        the hardware loop. Teardown performs the requested push synchronously.
         """
-        if self._push_executor is None:
-            return
-
-        if self._events.phase == DAggerPhase.CORRECTING:
-            logger.info("Skipping push — correction in progress")
-            return
-
-        if self._pending_push is not None and not self._pending_push.done():
-            logger.info("Previous push still in progress; queueing next")
-
-        def _push():
-            try:
-                with self._episode_lock:
-                    if safe_push_to_hub(
-                        dataset,
-                        tags=cfg.dataset.tags if cfg.dataset else None,
-                        private=cfg.dataset.private if cfg.dataset else False,
-                    ):
-                        self._needs_push.clear()
-                        logger.info("Background push to hub complete")
-            except Exception as e:
-                logger.error("Background push failed: %s", e)
-
-        self._pending_push = self._push_executor.submit(_push)
-        logger.info("Background push task submitted")
+        self._needs_push.set()
+        logger.info("Dataset upload queued for after hardware shutdown and finalization")

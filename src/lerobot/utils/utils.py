@@ -143,7 +143,11 @@ def log_say(text: str, play_sounds: bool = True, blocking: bool = False):
     logging.info(text)
 
     if play_sounds:
-        say(text, blocking)
+        try:
+            say(text, blocking)
+        except Exception as exc:
+            # Audio feedback is optional and must never interrupt dataset finalization or robot teardown.
+            logging.warning("Text-to-speech failed for %r: %s", text, exc)
 
 
 def get_channel_first_image_shape(image_shape: tuple) -> tuple:

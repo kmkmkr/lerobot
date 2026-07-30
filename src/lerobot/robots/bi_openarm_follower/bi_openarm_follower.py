@@ -170,57 +170,201 @@ class BiOpenArmFollower(BimanualMixin, Robot):
     def has_policy_deployment_trajectory(self) -> bool:
         return bool(self._deployment_trajectories)
 
+
+    @staticmethod
+    def _raise_after_all_safety_attempts(
+        failures: list[tuple[str, BaseException]], operation: str
+    ) -> None:
+        if not failures:
+            return
+        interruptions = [item for item in failures if not isinstance(item[1], Exception)]
+        primary_name, primary_error = (interruptions or failures)[0]
+        for name, error in failures:
+            if error is not primary_error:
+                primary_error.add_note(f"Additional {name} {operation} error: {error!r}")
+        primary_error.add_note(
+            f"{operation} failed or was interrupted at {primary_name}; all targets were still attempted"
+        )
+        raise primary_error
     def _disable_both_arms(self) -> None:
+        failures: list[tuple[str, BaseException]] = []
         for side, arm in (("left", self.left_arm), ("right", self.right_arm)):
             if not arm.bus.is_connected:
                 continue
             try:
-                arm.bus.disable_torque()
-            except Exception as error:
-                logger.error("Failed to disable %s OpenArm after deployment motion error: %s", side, error)
+                arm.bus.disable_torque(num_retry=2, require_response=True)
+            except BaseException as error:
+                error.add_note(f"Failed to disable {side} OpenArm follower after deployment motion error")
+                failures.append((side, error))
+                logger.exception("Failed to disable %s OpenArm after deployment motion error", side)
 
-    def _hold_both_arms_after_shutdown_error(self) -> None:
-        """Keep the last MIT command active when the shutdown return fails."""
-        for side, arm_config, arm in (
-            ("left", self.config.left_arm_config, self.left_arm),
-            ("right", self.config.right_arm_config, self.right_arm),
-        ):
-            # The rollout and motion-test teardown still disconnect the CAN
-            # sockets. Prevent that cleanup from disabling torque after a
-            # failed return, which would otherwise let the arm free-fall.
-            arm_config.disable_torque_on_disconnect = False
-            arm.config.disable_torque_on_disconnect = False
-            if not arm.bus.is_connected:
-                logger.error("Cannot refresh the %s OpenArm hold command because its CAN bus is closed", side)
-                continue
-            try:
-                current = arm.get_motor_positions()
-                trajectory_kp, trajectory_kd = arm.trajectory_position_gains()
-                sent = arm.send_action(
-                    {f"{motor_name}.pos": current[motor_name] for motor_name in MOTOR_NAMES},
-                    custom_kp=trajectory_kp,
-                    custom_kd=trajectory_kd,
-                    apply_max_relative_target=False,
+        self._raise_after_all_safety_attempts(failures, "follower torque disable")
+
+    @staticmethod
+    def _set_arm_disable_torque_on_disconnect(arm_config: Any, arm: Any, disable_torque: bool) -> None:
+        arm_config.disable_torque_on_disconnect = disable_torque
+        arm.config.disable_torque_on_disconnect = disable_torque
+
+    def _validated_fault_hold_positions(
+        self,
+        side: str,
+        current: dict[str, float],
+    ) -> dict[str, float]:
+        """Validate a fresh measured hold against physical, not policy, limits."""
+        physical_limits = OPENARM_V1_PHYSICAL_JOINT_LIMITS[side]
+        tolerance = self.config.deployment_start_limit_tolerance_deg
+        validated: dict[str, float] = {}
+        for motor_name in MOTOR_NAMES:
+            position = float(current[motor_name])
+            if not math.isfinite(position):
+                raise RuntimeError(
+                    f"OpenArm fault hold position is not finite: side={side} "
+                    f"motor={motor_name} actual={position}"
                 )
-                for motor_name in MOTOR_NAMES:
-                    requested = float(current[motor_name])
-                    actual = float(sent[f"{motor_name}.pos"])
-                    if not math.isclose(actual, requested, abs_tol=1e-6):
-                        logger.warning(
-                            "Clipped %s OpenArm shutdown hold target: motor=%s requested=%.3f sent=%.3f deg",
-                            side,
-                            motor_name,
-                            requested,
-                            actual,
-                        )
-            except Exception:
-                logger.exception("Failed to refresh the %s OpenArm hold command", side)
+            minimum, maximum = physical_limits[motor_name]
+            bounded = min(max(position, minimum), maximum)
+            excess = abs(position - bounded)
+            if excess > tolerance:
+                raise RuntimeError(
+                    f"OpenArm fault hold exceeds the physical limit: side={side} "
+                    f"motor={motor_name} actual={position:.3f} "
+                    f"limit=[{minimum:.3f}, {maximum:.3f}] excess={excess:.3f} "
+                    f"tolerance={tolerance:.3f} deg"
+                )
+            if excess > 0.0:
+                logger.warning(
+                    "Clamping measured OpenArm fault hold to its physical boundary: side=%s "
+                    "motor=%s actual=%.3f clamped=%.3f excess=%.3f deg",
+                    side,
+                    motor_name,
+                    position,
+                    bounded,
+                    excess,
+                )
+            validated[motor_name] = bounded
+        return validated
 
+    def _secure_follower_current_position_hold(self, side: str, arm_config: Any, arm: Any) -> bool:
+        """Enable one follower and issue a fresh measured-position hold command."""
+        self._set_arm_disable_torque_on_disconnect(arm_config, arm, True)
+        if not arm.bus.is_connected:
+            logger.critical(
+                "%s OpenArm follower is not held after fault: CAN is disconnected and torque state "
+                "is unknown.",
+                side,
+            )
+            return False
+
+        try:
+            current = arm.get_motor_positions(require_response=True)
+            hold_positions = self._validated_fault_hold_positions(side, current)
+            trajectory_kp, trajectory_kd = arm.trajectory_position_gains()
+            hold_action = {f"{motor_name}.pos": hold_positions[motor_name] for motor_name in MOTOR_NAMES}
+            # Preload the measured reference before enabling a device that may
+            # still contain a stale command, then confirm it again afterwards.
+            arm.send_action(
+                hold_action,
+                custom_kp=trajectory_kp,
+                custom_kd=trajectory_kd,
+                apply_joint_limits=False,
+                apply_max_relative_target=False,
+                require_response=True,
+            )
+            arm.bus.enable_torque(num_retry=2, require_response=True)
+            sent = arm.send_action(
+                hold_action,
+                custom_kp=trajectory_kp,
+                custom_kd=trajectory_kd,
+                apply_joint_limits=False,
+                apply_max_relative_target=False,
+                require_response=True,
+            )
+            for motor_name in MOTOR_NAMES:
+                requested = hold_positions[motor_name]
+                actual = float(sent[f"{motor_name}.pos"])
+                if not math.isclose(actual, requested, abs_tol=1e-6):
+                    raise RuntimeError(
+                        f"OpenArm fault hold target changed after physical validation: side={side} "
+                        f"motor={motor_name} requested={requested:.3f} sent={actual:.3f} deg"
+                    )
+        except BaseException as error:
+            try:
+                arm.bus.disable_torque(num_retry=2, require_response=True)
+            except BaseException as disable_error:
+                disable_status = f"torque-disable failed: {disable_error}"
+                logger.exception("Failed to disable %s OpenArm follower after hold error", side)
+            else:
+                disable_status = "torque-disable response verified"
+            logger.critical(
+                "%s OpenArm follower is not held after fault: %s. Fail-safe status: %s.",
+                side,
+                error,
+                disable_status,
+            )
+            return False
+
+        self._set_arm_disable_torque_on_disconnect(arm_config, arm, False)
         logger.critical(
-            "OpenArm shutdown return failed. Both followers will remain torque-enabled at their last "
-            "command when CAN is disconnected to prevent free-fall. Support the arms before removing "
-            "power or manually disabling torque."
+            "%s OpenArm follower is held by a current-position command issued after torque enable; "
+            "torque will be preserved across CAN disconnect.",
+            side,
         )
+        return True
+
+    def _hold_both_arms_after_shutdown_error(self) -> bool:
+        """Secure both followers and report only holds that were established."""
+        statuses = {
+            side: self._secure_follower_current_position_hold(side, arm_config, arm)
+            for side, arm_config, arm in (
+                ("left", self.config.left_arm_config, self.left_arm),
+                ("right", self.config.right_arm_config, self.right_arm),
+            )
+        }
+        logger.critical(
+            "OpenArm follower shutdown hold status: left=%s; right=%s. Support the arms before "
+            "removing power.",
+            "held" if statuses["left"] else "not held",
+            "held" if statuses["right"] else "not held",
+        )
+        return all(statuses.values())
+
+    def secure_intervention_after_fault(self, teleop: Any) -> dict[str, bool]:
+        """Secure all four OpenArm devices in place without a return trajectory.
+
+        Each follower and both leaders receive fresh measured-position holds.
+        A device is preserved across disconnect only after its torque-enable and
+        post-enable hold operations complete; failed devices are disabled.
+        """
+        statuses = {
+            f"follower_{side}": self._secure_follower_current_position_hold(side, arm_config, arm)
+            for side, arm_config, arm in (
+                ("left", self.config.left_arm_config, self.left_arm),
+                ("right", self.config.right_arm_config, self.right_arm),
+            )
+        }
+
+        secure_leaders = getattr(teleop, "secure_current_position_hold", None)
+        try:
+            if not callable(secure_leaders):
+                raise RuntimeError("teleoperator does not provide secure_current_position_hold()")
+            leaders_held = bool(secure_leaders())
+            if not leaders_held:
+                teleop.disable_torque(require_response=True)
+        except BaseException as error:
+            leaders_held = False
+            try:
+                teleop.disable_torque(require_response=True)
+            except BaseException:
+                logger.exception("Failed to disable OpenArm leaders after fault hold error")
+            logger.critical("OpenArm leaders are not held after intervention fault: %s", error)
+
+        statuses["leader_left"] = leaders_held
+        statuses["leader_right"] = leaders_held
+        logger.critical(
+            "OpenArm intervention fault handling completed without return motion: %s",
+            ", ".join(f"{device}={'held' if held else 'not held'}" for device, held in statuses.items()),
+        )
+        return statuses
 
     def _read_deployment_positions(self) -> dict[str, tuple[float, ...]]:
         left_positions = self.left_arm.get_motor_positions()
@@ -233,9 +377,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
     def _validate_intervention_teleop(self, teleop: Any) -> None:
         """Validate the bimanual leader contract before coordinated motion."""
         if getattr(teleop, "name", None) != "bi_openarm_leader":
-            raise ValueError(
-                "OpenArm DAgger deployment trajectories require --teleop.type=bi_openarm_leader"
-            )
+            raise ValueError("OpenArm DAgger deployment trajectories require --teleop.type=bi_openarm_leader")
         if not bool(getattr(teleop, "requires_continuous_feedback", False)):
             raise ValueError(
                 "OpenArm DAgger deployment trajectories require bilateral leader control; "
@@ -244,14 +386,14 @@ class BiOpenArmFollower(BimanualMixin, Robot):
         required_methods = (
             "get_action",
             "send_feedback",
+            "secure_current_position_hold",
             "disable_torque",
             "hold_position_after_shutdown_error",
         )
         missing_methods = [name for name in required_methods if not callable(getattr(teleop, name, None))]
         if missing_methods:
             raise ValueError(
-                "OpenArm DAgger teleoperator is missing coordinated deployment methods: "
-                f"{missing_methods}"
+                f"OpenArm DAgger teleoperator is missing coordinated deployment methods: {missing_methods}"
             )
         expected_features = {
             f"{side}_{motor_name}.pos" for side in ("left", "right") for motor_name in MOTOR_NAMES
@@ -259,8 +401,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
         missing_features = sorted(expected_features - set(teleop.feedback_features))
         if missing_features:
             raise ValueError(
-                "OpenArm DAgger teleoperator is missing deployment feedback features: "
-                f"{missing_features}"
+                f"OpenArm DAgger teleoperator is missing deployment feedback features: {missing_features}"
             )
 
     def _read_intervention_positions(self, teleop: Any) -> dict[str, tuple[float, ...]]:
@@ -315,9 +456,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
     ) -> None:
         error_limit = self.config.deployment_tracking_error_deg
         for side in ("left", "right"):
-            for motor_name, target, actual in zip(
-                MOTOR_NAMES, targets[side], measured[side], strict=True
-            ):
+            for motor_name, target, actual in zip(MOTOR_NAMES, targets[side], measured[side], strict=True):
                 tracking_error = abs(actual - target)
                 if tracking_error > error_limit:
                     raise RuntimeError(
@@ -563,30 +702,42 @@ class BiOpenArmFollower(BimanualMixin, Robot):
             )
 
     def _disable_intervention_hardware(self, teleop: Any) -> None:
-        self._disable_both_arms()
+        failures: list[tuple[str, BaseException]] = []
         try:
-            teleop.disable_torque()
-        except Exception:
+            self._disable_both_arms()
+        except BaseException as error:
+            failures.append(("followers", error))
+            logger.exception("Failed to disable both OpenArm followers after deployment motion error")
+        try:
+            teleop.disable_torque(require_response=True)
+        except BaseException as error:
+            failures.append(("leaders", error))
             logger.exception("Failed to disable both OpenArm leaders after deployment motion error")
 
+        self._raise_after_all_safety_attempts(failures, "intervention torque disable")
+
     def _hold_intervention_hardware_after_shutdown_error(self, teleop: Any) -> None:
-        self._hold_both_arms_after_shutdown_error()
+        failures: list[tuple[str, BaseException]] = []
+        try:
+            self._hold_both_arms_after_shutdown_error()
+        except BaseException as error:
+            failures.append(("followers", error))
+            logger.exception("Failed to preserve both OpenArm followers after shutdown return error")
         try:
             teleop.hold_position_after_shutdown_error()
-        except Exception:
+        except BaseException as error:
+            failures.append(("leaders", error))
             logger.exception("Failed to preserve both OpenArm leaders after shutdown return error")
+
+        self._raise_after_all_safety_attempts(failures, "intervention position hold")
 
     def prepare_for_intervention_deployment(self, teleop: Any) -> bool:
         """Move all four OpenArm devices through zero and the task-ready CSV."""
         if not self.has_policy_deployment_trajectory:
-            raise ValueError(
-                "OpenArm DAgger intervention requires --robot.deployment_trajectory_profile"
-            )
+            raise ValueError("OpenArm DAgger intervention requires --robot.deployment_trajectory_profile")
         self._validate_intervention_teleop(teleop)
 
-        logger.info(
-            "Moving both OpenArm leaders and followers to exact motor zero before CSV replay..."
-        )
+        logger.info("Moving both OpenArm leaders and followers to exact motor zero before CSV replay...")
         zero_targets = {"left": (0.0,) * len(MOTOR_NAMES), "right": (0.0,) * len(MOTOR_NAMES)}
         try:
             self._blend_intervention_positions(
@@ -640,8 +791,12 @@ class BiOpenArmFollower(BimanualMixin, Robot):
                 phase="startup-handover",
                 reference_time_s=0.0,
             )
-        except Exception:
-            self._disable_intervention_hardware(teleop)
+        except BaseException as error:
+            try:
+                self._disable_intervention_hardware(teleop)
+            except BaseException as cleanup_error:
+                error.add_note(f"Additional intervention startup cleanup error: {cleanup_error!r}")
+                logger.exception("Failed to disable all OpenArm intervention devices after startup error")
             raise
 
         logger.info(
@@ -696,8 +851,12 @@ class BiOpenArmFollower(BimanualMixin, Robot):
                 for motor_name, position in zip(MOTOR_NAMES, samples[-1].positions_deg, strict=True)
             }
             self.send_action(final_action)
-        except Exception:
-            self._disable_both_arms()
+        except BaseException as error:
+            try:
+                self._disable_both_arms()
+            except BaseException as cleanup_error:
+                error.add_note(f"Additional follower startup cleanup error: {cleanup_error!r}")
+                logger.exception("Failed to disable both OpenArm followers after startup error")
             raise
 
         logger.info("OpenArm followers are task-ready; policy inference gains are active.")
@@ -766,11 +925,15 @@ class BiOpenArmFollower(BimanualMixin, Robot):
                 self.config.shutdown_replay_speed,
                 "shutdown-replay",
             )
-        except Exception:
-            if self.config.hold_position_on_shutdown_error:
-                self._hold_both_arms_after_shutdown_error()
-            else:
-                self._disable_both_arms()
+        except BaseException as error:
+            try:
+                if self.config.hold_position_on_shutdown_error:
+                    self._hold_both_arms_after_shutdown_error()
+                else:
+                    self._disable_both_arms()
+            except BaseException as cleanup_error:
+                error.add_note(f"Additional follower shutdown cleanup error: {cleanup_error!r}")
+                logger.exception("Failed to secure both OpenArm followers after shutdown error")
             raise
 
         logger.info("Both OpenArm followers reached exact motor zero.")
@@ -779,9 +942,7 @@ class BiOpenArmFollower(BimanualMixin, Robot):
     def finish_intervention_deployment(self, teleop: Any) -> bool:
         """Return all four OpenArm devices along the reversed CSV path to zero."""
         if not self.has_policy_deployment_trajectory:
-            raise ValueError(
-                "OpenArm DAgger intervention requires --robot.deployment_trajectory_profile"
-            )
+            raise ValueError("OpenArm DAgger intervention requires --robot.deployment_trajectory_profile")
         self._validate_intervention_teleop(teleop)
 
         try:
@@ -841,11 +1002,15 @@ class BiOpenArmFollower(BimanualMixin, Robot):
                 self.config.shutdown_replay_speed,
                 "shutdown-replay",
             )
-        except Exception:
-            if self.config.hold_position_on_shutdown_error:
-                self._hold_intervention_hardware_after_shutdown_error(teleop)
-            else:
-                self._disable_intervention_hardware(teleop)
+        except BaseException as error:
+            try:
+                if self.config.hold_position_on_shutdown_error:
+                    self._hold_intervention_hardware_after_shutdown_error(teleop)
+                else:
+                    self._disable_intervention_hardware(teleop)
+            except BaseException as cleanup_error:
+                error.add_note(f"Additional intervention shutdown cleanup error: {cleanup_error!r}")
+                logger.exception("Failed to secure all OpenArm devices after shutdown error")
             raise
 
         logger.info("Both OpenArm leaders and followers reached exact motor zero.")
@@ -913,8 +1078,12 @@ class BiOpenArmFollower(BimanualMixin, Robot):
         try:
             sent_action_left = self.left_arm.send_action(left_action, custom_kp, custom_kd)
             sent_action_right = self.right_arm.send_action(right_action, custom_kp, custom_kd)
-        except Exception:
-            self._disable_both_arms()
+        except BaseException as error:
+            try:
+                self._disable_both_arms()
+            except BaseException as cleanup_error:
+                error.add_note(f"Additional bimanual follower action cleanup error: {cleanup_error!r}")
+                logger.exception("Failed to disable both OpenArm followers after action error")
             raise
 
         # Add prefixes back

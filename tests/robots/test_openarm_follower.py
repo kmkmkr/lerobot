@@ -288,6 +288,51 @@ def test_send_action_clips_in_v1_motor_zero_degrees(tmp_path):
     assert bus._mit_control_batch.call_args.args[0]["joint_6"][2] == -45.0
 
 
+def test_send_action_can_bypass_policy_limits_after_external_physical_validation(tmp_path):
+    robot, bus = _make_follower(OpenArmFollowerConfig(port="can0", side="right", calibration_dir=tmp_path))
+    robot.connect()
+
+    sent = robot.send_action(
+        {"joint_1.pos": 150.0},
+        apply_joint_limits=False,
+        apply_max_relative_target=False,
+    )
+
+    assert sent == {"joint_1.pos": 150.0}
+    assert bus._mit_control_batch.call_args.args[0]["joint_1"][2] == 150.0
+
+
+def test_send_action_forwards_target_velocity_to_mit_command(tmp_path):
+    robot, bus = _make_follower(OpenArmFollowerConfig(port="can0", side="right", calibration_dir=tmp_path))
+    robot.connect()
+
+    sent = robot.send_action({"joint_3.pos": 12.0, "joint_3.vel": 45.0})
+
+    assert sent == {"joint_3.pos": 12.0, "joint_3.vel": 45.0}
+    assert bus._mit_control_batch.call_args.args[0]["joint_3"][3] == 45.0
+
+
+def test_send_action_position_only_keeps_zero_mit_target_velocity(tmp_path):
+    robot, bus = _make_follower(OpenArmFollowerConfig(port="can0", side="right", calibration_dir=tmp_path))
+    robot.connect()
+
+    sent = robot.send_action({"joint_3.pos": 12.0})
+
+    assert sent == {"joint_3.pos": 12.0}
+    assert bus._mit_control_batch.call_args.args[0]["joint_3"][3] == 0.0
+
+
+def test_send_action_rejects_target_velocity_outside_mit_range(tmp_path):
+    robot, bus = _make_follower(OpenArmFollowerConfig(port="can0", side="right", calibration_dir=tmp_path))
+    robot.connect()
+    bus._mit_control_batch.reset_mock()
+
+    with pytest.raises(ValueError, match="target velocity.*MIT range"):
+        robot.send_action({"joint_3.pos": 12.0, "joint_3.vel": math.degrees(8.0) + 1.0})
+
+    bus._mit_control_batch.assert_not_called()
+
+
 def test_trajectory_commands_use_gains_separate_from_policy_actions(tmp_path):
     robot, bus = _make_follower(
         OpenArmFollowerConfig(
@@ -339,6 +384,55 @@ def test_validated_trajectory_can_bypass_policy_relative_target_limit(tmp_path):
     assert sent == {"joint_4.pos": 18.315}
     assert bus._mit_control_batch.call_args.args[0]["joint_4"][2] == 18.315
     bus.sync_read.assert_not_called()
+
+
+def test_disconnect_cleans_up_a_can_only_partial_connection_strictly(tmp_path):
+    config = OpenArmFollowerConfig(port="can0", side="right", calibration_dir=tmp_path)
+    robot, bus = _make_follower(config)
+    camera = MagicMock()
+    camera.is_connected = False
+    robot.cameras = {"failed": camera}
+    bus.is_connected = True
+
+    assert not robot.is_connected
+    robot.disconnect()
+
+    bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)
+    bus.disconnect.assert_called_once_with(False)
+    camera.disconnect.assert_not_called()
+
+
+def test_camera_connect_failure_strictly_disables_and_closes_can(tmp_path):
+    config = OpenArmFollowerConfig(
+        port="can0",
+        side="right",
+        calibration_dir=tmp_path,
+        disable_torque_on_disconnect=False,
+    )
+    robot, bus = _make_follower(config)
+    camera = MagicMock()
+    camera.is_connected = False
+    camera.connect.side_effect = RuntimeError("camera unavailable")
+    robot.cameras = {"failed": camera}
+
+    with pytest.raises(RuntimeError, match="camera unavailable"):
+        robot.connect()
+
+    bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)
+    bus.disconnect.assert_called_once_with(False)
+    assert not bus.is_connected
+
+
+def test_disconnect_closes_can_even_when_strict_disable_fails(tmp_path):
+    config = OpenArmFollowerConfig(port="can0", side="right", calibration_dir=tmp_path)
+    robot, bus = _make_follower(config)
+    bus.is_connected = True
+    bus.disable_torque.side_effect = RuntimeError("ACK missing")
+
+    with pytest.raises(RuntimeError, match="ACK missing"):
+        robot.disconnect()
+
+    bus.disconnect.assert_called_once_with(False)
 
 
 def test_generic_lerobot_calibration_is_rejected_without_writing_zero(tmp_path):
@@ -465,5 +559,5 @@ def test_bimanual_action_error_disables_both_followers(tmp_path):
     with pytest.raises(RuntimeError, match="compensation failed"):
         robot.send_action({"left_joint_1.pos": 0.0, "right_joint_1.pos": 0.0})
 
-    left_bus.disable_torque.assert_called_once_with()
-    right_bus.disable_torque.assert_called_once_with()
+    left_bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)
+    right_bus.disable_torque.assert_called_once_with(num_retry=2, require_response=True)

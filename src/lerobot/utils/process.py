@@ -31,7 +31,12 @@ class ProcessSignalHandler:
 
     _SUPPORTED_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")
 
-    def __init__(self, use_threads: bool, display_pid: bool = False):
+    def __init__(
+        self,
+        use_threads: bool,
+        display_pid: bool = False,
+        raise_on_first_signal: bool = False,
+    ):
         # TODO: Check if we can use Event from threading since Event from
         # multiprocessing is the a clone of threading.Event.
         # https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Event
@@ -43,6 +48,7 @@ class ProcessSignalHandler:
         self.shutdown_event = Event()
         self._counter: int = 0
         self._display_pid = display_pid
+        self._raise_on_first_signal = raise_on_first_signal
 
         self._register_handlers()
 
@@ -61,6 +67,9 @@ class ProcessSignalHandler:
             logging.info(f"{pid_str} Shutdown signal {signum} received. Cleaning up…")
             self.shutdown_event.set()
             self._counter += 1
+
+            if self._counter == 1 and self._raise_on_first_signal:
+                raise KeyboardInterrupt("Rollout interrupted by a shutdown signal")
 
             # On a second Ctrl-C (or any supported signal) force the exit to
             # mimic the previous behaviour while giving the caller one chance to
