@@ -26,7 +26,6 @@ from pathlib import Path
 
 import datasets
 import numpy as np
-import pandas as pd
 import PIL.Image
 import pyarrow.parquet as pq
 import torch
@@ -51,12 +50,10 @@ from .image_writer import AsyncImageWriter, write_image
 from .io_utils import (
     embed_images,
     get_file_size_in_mb,
-    load_episodes,
     write_info,
 )
 from .utils import (
     DEFAULT_DEPTH_PATH,
-    DEFAULT_EPISODES_PATH,
     DEFAULT_IMAGE_PATH,
     update_chunk_file_indices,
 )
@@ -143,6 +140,13 @@ class DatasetWriter:
         self._batch_encoding_size = batch_encoding_size
         self._streaming_encoder = streaming_encoder
 
+        # Batched video metadata must remain mutable until the corresponding
+        # frames have been encoded.  Keep one slot beyond a full video batch so
+        # LeRobotDatasetMetadata does not auto-flush rows without their video
+        # fields immediately before this writer can update them.
+        if batch_encoding_size > 1:
+            self._meta._metadata_buffer_size = max(self._meta._metadata_buffer_size, batch_encoding_size + 1)
+
         # Writer state
         self.image_writer: AsyncImageWriter | None = None
         self.episode_buffer: dict = self._create_episode_buffer()
@@ -150,6 +154,7 @@ class DatasetWriter:
         self._latest_episode: dict | None = None
         self._current_file_start_frame: int | None = None
         self._episodes_since_last_encoding: int = 0
+        self._latest_encoded_episode: dict | None = None
         self._recorded_frames: int = initial_frames
         self._finalized = False
 
@@ -376,45 +381,59 @@ class DatasetWriter:
         if end_episode is None:
             end_episode = self._meta.total_episodes
 
-        logger.info(
-            f"Batch encoding {self._batch_encoding_size} videos for episodes {start_episode} to {end_episode - 1}"
-        )
+        logger.info(f"Batch encoding videos for episodes {start_episode} to {end_episode - 1}")
 
-        chunk_idx = self._meta.episodes[start_episode]["data/chunk_index"]
-        file_idx = self._meta.episodes[start_episode]["data/file_index"]
-        episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
-            chunk_index=chunk_idx, file_index=file_idx
-        )
-        episode_df = pd.read_parquet(episode_df_path)
+        buffered_episodes = {}
+        for episode in self._meta._metadata_buffer:
+            episode_index = episode["episode_index"]
+            if isinstance(episode_index, list):
+                episode_index = episode_index[0]
+            buffered_episodes[int(episode_index)] = episode
 
+        missing_episodes = [
+            ep_idx for ep_idx in range(start_episode, end_episode) if ep_idx not in buffered_episodes
+        ]
+        if missing_episodes:
+            raise RuntimeError(
+                "Cannot batch-encode video because episode metadata was flushed before its video "
+                f"fields were added: missing episode indices {missing_episodes}."
+            )
+
+        if self._latest_encoded_episode is None:
+            if start_episode > 0 and self._meta.episodes is not None:
+                previous_episode = self._meta.episodes[start_episode - 1]
+                self._latest_encoded_episode = {key: [value] for key, value in previous_episode.items()}
+            else:
+                self._latest_encoded_episode = None
+        self._meta.latest_episode = self._latest_encoded_episode
+
+        staged_metadata: dict[int, dict] = {}
         for ep_idx in range(start_episode, end_episode):
             logger.info(f"Encoding videos for episode {ep_idx}")
-
-            if (
-                self._meta.episodes[ep_idx]["data/chunk_index"] != chunk_idx
-                or self._meta.episodes[ep_idx]["data/file_index"] != file_idx
-            ):
-                episode_df.to_parquet(episode_df_path)
-                self._meta.episodes = load_episodes(self._root)
-
-                chunk_idx = self._meta.episodes[ep_idx]["data/chunk_index"]
-                file_idx = self._meta.episodes[ep_idx]["data/file_index"]
-                episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
-                    chunk_index=chunk_idx, file_index=file_idx
-                )
-                episode_df = pd.read_parquet(episode_df_path)
 
             video_ep_metadata = {}
             for video_key in self._meta.video_keys:
                 video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
-            video_ep_metadata.pop("episode_index")
-            video_ep_df = pd.DataFrame(video_ep_metadata, index=[ep_idx]).convert_dtypes(
-                dtype_backend="pyarrow"
-            )
+            staged_metadata[ep_idx] = {key: [value] for key, value in video_ep_metadata.items()}
 
-            episode_df = episode_df.combine_first(video_ep_df)
-            episode_df.to_parquet(episode_df_path)
-            self._meta.episodes = load_episodes(self._root)
+            # Use a staged copy as the previous-video state for the next
+            # episode.  Do not mutate the shared metadata buffer until every
+            # codec call in this batch has succeeded; otherwise a mid-batch
+            # failure would leave rows with different schemas and mask the
+            # original codec error during metadata finalization.
+            staged_episode = {**buffered_episodes[ep_idx], **staged_metadata[ep_idx]}
+            self._latest_encoded_episode = staged_episode
+            self._meta.latest_episode = staged_episode
+
+        for ep_idx, video_ep_metadata in staged_metadata.items():
+            buffered_episodes[ep_idx].update(video_ep_metadata)
+        self._latest_encoded_episode = buffered_episodes[end_episode - 1]
+        self._meta.latest_episode = self._latest_encoded_episode
+
+        # Flush only after every row in this batch has a complete video schema.
+        # The metadata writer remains open, so a later batch appends instead of
+        # reopening and truncating the same parquet file.
+        self._meta._flush_metadata_buffer()
 
     def _save_episode_data(self, episode_buffer: dict) -> dict:
         """Save episode data to a parquet file."""
@@ -678,12 +697,15 @@ class DatasetWriter:
             self.image_writer.wait_until_done()
             self.image_writer.stop()
             self.image_writer = None
-        # 2. Flush pending video encoding (streaming or batch)
-        self.flush_pending_videos()
-        # 3. Close own parquet writer
+        # 2. Close data parquet before video encoding.  If a codec fails, the
+        # already-recorded state/action rows still retain a valid footer.
         self.close_writer()
-        # 4. Finalize metadata (idempotent)
-        self._meta.finalize()
+        # 3. Flush pending video encoding (streaming or batch), and close
+        # metadata even when encoding raises.
+        try:
+            self.flush_pending_videos()
+        finally:
+            self._meta.finalize()
         self._finalized = True
 
     def __del__(self):

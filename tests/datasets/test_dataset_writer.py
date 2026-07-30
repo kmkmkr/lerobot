@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import torch
 from PIL import Image
@@ -27,6 +28,7 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 
 from lerobot.configs import VideoEncoderConfig
 from lerobot.datasets.dataset_writer import _encode_video_worker
+from lerobot.datasets.io_utils import load_episodes
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
@@ -236,3 +238,136 @@ def test_finalize_then_read_roundtrip(tmp_path):
     for i in range(5):
         item = dataset[i]
         assert torch.allclose(item["state"], known_states[i], atol=1e-5)
+
+
+@pytest.mark.parametrize(("batch_encoding_size", "num_episodes"), [(2, 4), (3, 2)])
+def test_deferred_batch_video_encoding_flushes_buffered_metadata(tmp_path, batch_encoding_size, num_episodes):
+    """Batched video encoding works before or during finalize with buffered metadata."""
+    root = tmp_path / f"batch-{batch_encoding_size}"
+    video_key = "observation.images.test"
+    features = {
+        video_key: {
+            "dtype": "video",
+            "shape": (8, 8, 3),
+            "names": ["height", "width", "channels"],
+        }
+    }
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=DEFAULT_FPS,
+        features=features,
+        root=root,
+        batch_encoding_size=batch_encoding_size,
+        metadata_buffer_size=10,
+    )
+
+    encoded_temp_dirs = []
+
+    def fake_encode(video_key: str, episode_index: int) -> Path:
+        temp_dir = root / f"encoded-{video_key.replace('.', '-')}-{episode_index}"
+        temp_dir.mkdir()
+        encoded_temp_dirs.append(temp_dir)
+        temp_path = temp_dir / "episode.mp4"
+        temp_path.write_bytes(b"test-video")
+        return temp_path
+
+    with (
+        patch.object(dataset.writer, "_encode_temporary_episode_video", side_effect=fake_encode),
+        patch.object(dataset.meta, "update_video_info"),
+        patch("lerobot.datasets.dataset_writer.get_file_size_in_mb", return_value=0.01),
+        patch("lerobot.datasets.dataset_writer.get_video_duration_in_s", return_value=0.5),
+        patch("lerobot.datasets.dataset_writer.concatenate_video_files") as concatenate,
+    ):
+        for episode_index in range(num_episodes):
+            dataset.add_frame(
+                {
+                    video_key: np.full((8, 8, 3), episode_index, dtype=np.uint8),
+                    "task": "Deferred batch test",
+                }
+            )
+            dataset.save_episode()
+
+        if num_episodes < batch_encoding_size:
+            assert dataset.meta.episodes is None
+            assert len(dataset.meta._metadata_buffer) == num_episodes
+
+        dataset.finalize()
+
+    episodes = load_episodes(root)
+    assert len(episodes) == num_episodes
+    for episode_index in range(num_episodes):
+        assert episodes[episode_index][f"videos/{video_key}/from_timestamp"] == pytest.approx(
+            episode_index * 0.5
+        )
+        assert episodes[episode_index][f"videos/{video_key}/to_timestamp"] == pytest.approx(
+            (episode_index + 1) * 0.5
+        )
+    assert concatenate.call_count == num_episodes - 1
+    assert all(not path.exists() for path in encoded_temp_dirs)
+    assert dataset.writer._pq_writer is None
+    assert dataset.meta._pq_writer is None
+
+    data_files = list((root / "data").rglob("*.parquet"))
+    assert len(data_files) == 1
+    assert pq.read_table(data_files[0]).num_rows == num_episodes
+    assert len(LeRobotDataset(DUMMY_REPO_ID, root=root)) == num_episodes
+
+
+def test_finalize_closes_data_and_metadata_when_deferred_video_encoding_fails(tmp_path):
+    """A post-recording codec failure must not leave parquet writers without footers."""
+    root = tmp_path / "failed-video-finalize"
+    video_key = "observation.images.test"
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=DEFAULT_FPS,
+        features={
+            video_key: {
+                "dtype": "video",
+                "shape": (8, 8, 3),
+                "names": ["height", "width", "channels"],
+            }
+        },
+        root=root,
+        batch_encoding_size=3,
+        metadata_buffer_size=10,
+    )
+    for episode_index in range(2):
+        dataset.add_frame(
+            {
+                video_key: np.full((8, 8, 3), episode_index, dtype=np.uint8),
+                "task": "Failed finalize test",
+            }
+        )
+        dataset.save_episode()
+
+    def fail_on_second_episode(video_key: str, episode_index: int) -> dict:
+        if episode_index == 1:
+            raise RuntimeError("codec failed")
+        return {
+            "episode_index": episode_index,
+            f"videos/{video_key}/chunk_index": 0,
+            f"videos/{video_key}/file_index": 0,
+            f"videos/{video_key}/from_timestamp": 0.0,
+            f"videos/{video_key}/to_timestamp": 0.5,
+        }
+
+    with (
+        patch.object(dataset.writer, "_save_episode_video", side_effect=fail_on_second_episode),
+        pytest.raises(RuntimeError, match="codec failed") as exc_info,
+    ):
+        dataset.finalize()
+
+    assert str(exc_info.value) == "codec failed"
+    assert dataset.writer._pq_writer is None
+    assert dataset.meta._pq_writer is None
+    data_files = list((root / "data").rglob("*.parquet"))
+    assert len(data_files) == 1
+    assert pq.read_table(data_files[0]).num_rows == 2
+    episodes = load_episodes(root)
+    assert len(episodes) == 2
+    assert all(not key.startswith("videos/") for key in episodes.column_names)
+
+    # Prevent the destructor safety net from retrying intentionally failed
+    # video encoding after this test's mock has been removed.
+    dataset.writer._episodes_since_last_encoding = 0
+    dataset.writer.finalize()
