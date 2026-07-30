@@ -193,6 +193,16 @@ class DAggerPhase(enum.Enum):
     CORRECTING = "correcting"  # Human driving via teleop, recording interventions
 
 
+def _set_robot_intervention_phase(
+    robot_wrapper, old_phase: DAggerPhase, new_phase: DAggerPhase
+) -> None:
+    """Notify robots that opt into DAgger intervention phase changes."""
+    robot = getattr(robot_wrapper, "inner", robot_wrapper)
+    set_phase = getattr(robot, "set_intervention_phase", None)
+    if callable(set_phase):
+        set_phase(old_phase.value, new_phase.value)
+
+
 # Valid (current_phase, event) -> next_phase
 _DAGGER_TRANSITIONS: dict[tuple[DAggerPhase, str], DAggerPhase] = {
     (DAggerPhase.AUTONOMOUS, "pause_resume"): DAggerPhase.PAUSED,
@@ -1106,6 +1116,10 @@ class DAggerStrategy(RolloutStrategy):
 
         Continuous-feedback teleops keep torque enabled for all transitions;
         the main loop supplies measured follower feedback in every phase.
+
+        Robots exposing ``set_intervention_phase(old_phase, new_phase)`` are
+        notified at these safe boundaries.  The AUTONOMOUS notification occurs
+        before inference restarts, so hardware may hold until its next action.
         """
         teleop = ctx.hardware.teleop
         robot = ctx.hardware.robot_wrapper
@@ -1116,6 +1130,7 @@ class DAggerStrategy(RolloutStrategy):
         if old_phase == DAggerPhase.AUTONOMOUS and new_phase == DAggerPhase.PAUSED:
             logger.info("Pausing engine - robot holds position")
             engine.pause()
+            _set_robot_intervention_phase(robot, old_phase, new_phase)
 
             if supports_feedback and not continuous_feedback and prev_action is not None:
                 # TODO(Maxime): prev_action is in robot action key space (output of robot_action_processor).
@@ -1127,6 +1142,7 @@ class DAggerStrategy(RolloutStrategy):
                 teleop_smooth_move_to(teleop, prev_action)
 
         elif old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
+            _set_robot_intervention_phase(robot, old_phase, new_phase)
             logger.info("Entering correction mode - human teleop control")
             if not supports_feedback and prev_action is not None:
                 logger.info("Smooth handover: sliding follower to teleop position")
@@ -1141,10 +1157,12 @@ class DAggerStrategy(RolloutStrategy):
                 teleop.disable_torque()
 
         elif old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
+            _set_robot_intervention_phase(robot, old_phase, new_phase)
             if supports_feedback and not continuous_feedback:
                 teleop.enable_torque()
 
         elif new_phase == DAggerPhase.AUTONOMOUS:
+            _set_robot_intervention_phase(robot, old_phase, new_phase)
             logger.info("Resuming autonomous mode - resetting engine and interpolator")
             interpolator.reset()
             engine.reset()

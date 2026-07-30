@@ -178,6 +178,72 @@ def test_dagger_resume_notifies_fresh_observation_before_engine_resume() -> None
     assert calls == ["notify", "resume"]
 
 
+def test_dagger_notifies_inner_robot_of_phase_changes_in_safe_order() -> None:
+    calls: list[str] = []
+
+    class PhaseAwareRobot:
+        def set_intervention_phase(self, old_phase: str, new_phase: str) -> None:
+            calls.append(f"phase:{old_phase}->{new_phase}")
+
+    engine = MagicMock()
+    engine.pause.side_effect = lambda: calls.append("engine.pause")
+    engine.reset.side_effect = lambda: calls.append("engine.reset")
+    interpolator = MagicMock()
+    ctx = SimpleNamespace(
+        hardware=SimpleNamespace(
+            robot_wrapper=SimpleNamespace(inner=PhaseAwareRobot()),
+            teleop=SimpleNamespace(feedback_features={}),
+        )
+    )
+
+    assert not DAggerStrategy._apply_transition(
+        DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED, engine, interpolator, ctx, None
+    )
+    assert not DAggerStrategy._apply_transition(
+        DAggerPhase.PAUSED, DAggerPhase.CORRECTING, engine, interpolator, ctx, None
+    )
+    assert not DAggerStrategy._apply_transition(
+        DAggerPhase.CORRECTING, DAggerPhase.PAUSED, engine, interpolator, ctx, None
+    )
+    assert DAggerStrategy._apply_transition(
+        DAggerPhase.PAUSED, DAggerPhase.AUTONOMOUS, engine, interpolator, ctx, None
+    )
+
+    assert calls == [
+        "engine.pause",
+        "phase:autonomous->paused",
+        "phase:paused->correcting",
+        "phase:correcting->paused",
+        "phase:paused->autonomous",
+        "engine.reset",
+    ]
+    engine.resume.assert_not_called()
+
+
+def test_dagger_phase_hook_is_optional_and_propagates_failures() -> None:
+    engine = MagicMock()
+    ctx = SimpleNamespace(
+        hardware=SimpleNamespace(
+            robot_wrapper=SimpleNamespace(inner=object()),
+            teleop=SimpleNamespace(feedback_features={}),
+        )
+    )
+
+    assert not DAggerStrategy._apply_transition(
+        DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED, engine, MagicMock(), ctx, None
+    )
+
+    fault = RuntimeError("phase hook failed")
+    robot = SimpleNamespace(set_intervention_phase=MagicMock(side_effect=fault))
+    ctx.hardware.robot_wrapper = SimpleNamespace(inner=robot)
+    with pytest.raises(RuntimeError, match="phase hook failed") as exc_info:
+        DAggerStrategy._apply_transition(
+            DAggerPhase.PAUSED, DAggerPhase.CORRECTING, engine, MagicMock(), ctx, None
+        )
+
+    assert exc_info.value is fault
+
+
 @pytest.mark.parametrize(
     ("event", "new_phase"),
     [("correction", DAggerPhase.CORRECTING), ("pause_resume", DAggerPhase.AUTONOMOUS)],
