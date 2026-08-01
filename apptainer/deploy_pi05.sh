@@ -34,9 +34,9 @@ apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-rollout \
   --task='Pick up the large green gear and place it in the red recessed area of the blue board.' \
   --fps=30 \
   --play_sounds=false \
-  --duration=30 \
+  --duration=10000 \
   --return_to_initial_position=true \
   --strategy.type=episodic \
   --dataset.num_episodes=1 \
-  --dataset.episode_time_s=30 \
+  --dataset.episode_time_s=10000 \
   --dataset.reset_time_s=0 \
