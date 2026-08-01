@@ -106,7 +106,13 @@ class DAggerKeyboardConfig:
 
     pause_resume: str = "space"
     correction: str = "tab"
+    discard: str = "backspace"
     upload: str = "enter"
+
+    def __post_init__(self) -> None:
+        bindings = (self.pause_resume, self.correction, self.discard, self.upload)
+        if len(set(bindings)) != len(bindings):
+            raise ValueError("DAgger keyboard controls must use distinct keys")
 
 
 @dataclass
@@ -120,6 +126,34 @@ class DAggerPedalConfig:
     pause_resume: str = "KEY_A"
     correction: str = "KEY_B"
     upload: str = "KEY_C"
+
+
+@dataclass
+class DAggerWebUIConfig:
+    """Optional localhost browser controls and camera previews for DAgger.
+
+    The web UI supplements the configured keyboard or pedal; it never becomes
+    the sole input backend. Port ``0`` asks the OS to choose a free port.
+    """
+
+    enabled: bool = False
+    port: int = 8000
+    auto_port: bool = True
+    camera_preview: bool = True
+    preview_fps: float = 5.0
+    jpeg_quality: int = 80
+
+    def __post_init__(self) -> None:
+        if type(self.port) is not int or not 0 <= self.port <= 65535:
+            raise ValueError("DAgger web_ui.port must be an integer between 0 and 65535")
+        if (
+            isinstance(self.preview_fps, bool)
+            or not math.isfinite(self.preview_fps)
+            or not 1.0 <= self.preview_fps <= 30.0
+        ):
+            raise ValueError("DAgger web_ui.preview_fps must be finite and between 1 and 30")
+        if type(self.jpeg_quality) is not int or not 1 <= self.jpeg_quality <= 100:
+            raise ValueError("DAgger web_ui.jpeg_quality must be an integer between 1 and 100")
 
 
 @RolloutStrategyConfig.register_subclass("episodic")
@@ -159,12 +193,15 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     Alternates between autonomous policy execution and human intervention.
     Intervention frames are tagged with ``intervention=True``.
 
-    Input is controlled via either a keyboard or foot pedal, selected by
-    ``input_device``.  Each device exposes three actions:
+    Primary input is controlled via either a keyboard or foot pedal, selected
+    by ``input_device``. The optional localhost web UI supplements that input.
+    Each backend exposes three actions, and keyboard/web input additionally
+    supports discarding the active correction:
 
     1. **pause_resume** — toggle policy execution on/off.
     2. **correction** — toggle human correction recording.
-    3. **upload** — push dataset to hub on demand (corrections-only mode).
+    3. **discard** — leave correction mode without saving (corrections-only mode).
+    4. **upload** — push dataset to hub on demand (corrections-only mode).
 
     When ``record_autonomous=False`` (default) only human-correction windows
     are recorded — each correction becomes its own episode.  Set to ``True``
@@ -182,6 +219,12 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     # When None, falls back to ``--dataset.num_episodes``.
     num_episodes: int | None = None
     record_autonomous: bool = False
+    # Corrections-only episode persistence. ``background`` keeps the generic
+    # control loop ticking while a worker saves. ``synchronous`` finishes the
+    # complete episode save before accepting another phase transition and is
+    # intended for deployments whose lower-level controller maintains a safe
+    # PAUSED hold independently of the Python loop.
+    correction_persistence: str = "background"
     upload_every_n_episodes: int = 5
     # Target video file size in MB for episode rotation (record_autonomous
     # mode only).  Defaults to DEFAULT_VIDEO_FILE_SIZE_IN_MB when None.
@@ -197,10 +240,20 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     input_device: str = "keyboard"
     keyboard: DAggerKeyboardConfig = field(default_factory=DAggerKeyboardConfig)
     pedal: DAggerPedalConfig = field(default_factory=DAggerPedalConfig)
+    web_ui: DAggerWebUIConfig = field(default_factory=DAggerWebUIConfig)
 
     def __post_init__(self):
         if self.input_device not in ("keyboard", "pedal"):
             raise ValueError(f"DAgger input_device must be 'keyboard' or 'pedal', got '{self.input_device}'")
+        if self.correction_persistence not in ("background", "synchronous"):
+            raise ValueError(
+                "DAgger correction_persistence must be 'background' or 'synchronous', "
+                f"got '{self.correction_persistence}'"
+            )
+        if self.record_autonomous and self.correction_persistence != "background":
+            raise ValueError(
+                "DAgger correction_persistence applies only when record_autonomous=False"
+            )
 
         if not math.isfinite(self.resume_blend_duration_s) or self.resume_blend_duration_s < 0:
             raise ValueError("DAgger resume_blend_duration_s must be finite and >= 0")

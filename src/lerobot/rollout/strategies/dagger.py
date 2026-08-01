@@ -18,12 +18,14 @@ Implements the RaC paradigm (Recovery and Correction) for interactive
 imitation learning.  Alternates between autonomous policy execution and
 human intervention via teleoperator.
 
-Input is controlled via either a keyboard or foot pedal, selected by
-the ``input_device`` config field.  Each device exposes three actions:
+Primary input is controlled via either a keyboard or foot pedal, selected by
+the ``input_device`` config field. An optional localhost web UI supplements
+that backend. Each input exposes three actions:
 
     1. **pause_resume** — Toggle policy execution (AUTONOMOUS <-> PAUSED).
     2. **correction**   — Toggle correction recording (PAUSED <-> CORRECTING).
-    3. **upload**        — Push dataset to hub on demand (corrections-only mode).
+    3. **discard**      — Discard active correction (CORRECTING -> PAUSED).
+    4. **upload**       — Queue a Hub push (corrections-only mode).
     ESC (keyboard only) — Stop session.
 
 Recording modes:
@@ -78,6 +80,7 @@ from ..async_dataset import AsyncEpisodeSaver
 from ..configs import DAggerKeyboardConfig, DAggerPedalConfig, DAggerStrategyConfig
 from ..context import RolloutContext
 from .core import RolloutStrategy, estimate_max_episode_seconds, safe_push_to_hub, send_next_action
+from .dagger_web_ui import DAggerWebUI
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +248,7 @@ _DAGGER_TRANSITIONS: dict[tuple[DAggerPhase, str], DAggerPhase] = {
     (DAggerPhase.PAUSED, "pause_resume"): DAggerPhase.AUTONOMOUS,
     (DAggerPhase.PAUSED, "correction"): DAggerPhase.CORRECTING,
     (DAggerPhase.CORRECTING, "correction"): DAggerPhase.PAUSED,
+    (DAggerPhase.CORRECTING, "discard"): DAggerPhase.PAUSED,
 }
 
 
@@ -263,6 +267,9 @@ class DAggerEvents:
         # Session-level flags
         self.stop_recording = Event()
         self.upload_requested = Event()
+        # This remains latched until the correction buffer is confirmed clear,
+        # including when shutdown races the requested phase transition.
+        self.discard_requested = Event()
 
     # -- Thread-safe phase access ------------------------------------------
 
@@ -277,24 +284,58 @@ class DAggerEvents:
         with self._lock:
             self._phase = value
 
-    def request_transition(self, event: str) -> None:
+    def request_transition(
+        self,
+        event: str,
+        *,
+        expected_phase: DAggerPhase | None = None,
+    ) -> bool:
         """Request a phase transition (called from keyboard/pedal threads).
 
         Only enqueues the request if it corresponds to a valid transition
-        from the current phase, preventing impossible state changes.
+        from the current phase, preventing impossible state changes. Web UI
+        callers provide ``expected_phase`` so a stale browser button can never
+        apply the opposite side of a toggle.
         """
         with self._lock:
-            if (self._phase, event) in _DAGGER_TRANSITIONS:
+            if (
+                (expected_phase is None or self._phase == expected_phase)
+                and self._pending_transition is None
+                and (self._phase, event) in _DAGGER_TRANSITIONS
+            ):
                 self._pending_transition = event
+                if event == "discard":
+                    self.discard_requested.set()
+                return True
+            return False
+
+    def request_upload(self) -> bool:
+        self.upload_requested.set()
+        return True
+
+    def request_stop(self) -> bool:
+        self.stop_recording.set()
+        return True
 
     def consume_transition(
         self, *, paused_transition_ready: bool = True
     ) -> tuple[DAggerPhase, DAggerPhase] | None:
         """Consume a pending transition (called from main loop)."""
+        transition = self.consume_transition_with_event(paused_transition_ready=paused_transition_ready)
+        if transition is None:
+            return None
+        old_phase, new_phase, _event = transition
+        return old_phase, new_phase
+
+    def consume_transition_with_event(
+        self, *, paused_transition_ready: bool = True
+    ) -> tuple[DAggerPhase, DAggerPhase, str] | None:
+        """Consume a transition while preserving whether it saves or discards."""
         with self._lock:
             if self._pending_transition is None:
                 return None
-            key = (self._phase, self._pending_transition)
+            event = self._pending_transition
+            key = (self._phase, event)
             if self._phase == DAggerPhase.PAUSED and not paused_transition_ready:
                 return None
             self._pending_transition = None
@@ -303,7 +344,7 @@ class DAggerEvents:
                 return None
             old_phase = self._phase
             self._phase = new_phase
-            return old_phase, new_phase
+            return old_phase, new_phase, event
 
     def reset(self) -> None:
         """Reset all transient state for a fresh session."""
@@ -311,6 +352,7 @@ class DAggerEvents:
             self._phase = DAggerPhase.AUTONOMOUS
             self._pending_transition = None
         self.upload_requested.clear()
+        self.discard_requested.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -318,8 +360,13 @@ class DAggerEvents:
 # ---------------------------------------------------------------------------
 
 
-def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
-    """Initialise a keyboard listener for DAgger's 3 controls.
+def _init_dagger_keyboard(
+    events: DAggerEvents,
+    cfg: DAggerKeyboardConfig,
+    *,
+    allow_discard: bool = True,
+):
+    """Initialise a keyboard listener for DAgger controls.
 
     Backend selection is delegated to :func:`create_key_listener`. DAgger prefers the
     controlling POSIX terminal even when X11 is available, then falls back to a usable
@@ -331,24 +378,27 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
         cfg.pause_resume: "pause_resume",
         cfg.correction: "correction",
     }
+    if allow_discard:
+        key_to_event[cfg.discard] = "discard"
 
     def dispatch(name: str) -> None:
         """Apply a resolved key name to the DAgger events."""
         if name == "esc":
             logger.info("Stop recording...")
-            events.stop_recording.set()
+            events.request_stop()
             return
         if name in key_to_event:
             events.request_transition(key_to_event[name])
         if name == cfg.upload:
-            events.upload_requested.set()
+            events.request_upload()
 
+    discard_help = f", discard='{cfg.discard}'" if allow_discard else ""
     return create_key_listener(
         dispatch,
         prefer_terminal=True,
         controls_help=(
             f"pause_resume='{cfg.pause_resume}', correction='{cfg.correction}', "
-            f"upload='{cfg.upload}', ESC=stop"
+            f"upload='{cfg.upload}'{discard_help}, ESC=stop"
         ),
     )
 
@@ -367,7 +417,7 @@ def _init_dagger_pedal(events: DAggerEvents, cfg: DAggerPedalConfig):
         if code in code_to_event:
             events.request_transition(code_to_event[code])
         if code == cfg.upload:
-            events.upload_requested.set()
+            events.request_upload()
 
     logger.info("Initializing DAgger foot pedal listener (device=%s)", cfg.device_path)
     return start_pedal_listener(on_press, device_path=cfg.device_path)
@@ -399,6 +449,7 @@ class DAggerStrategy(RolloutStrategy):
         super().__init__(config)
         self._listener = None
         self._pedal_thread = None
+        self._web_ui: DAggerWebUI | None = None
         self._events = DAggerEvents()
         self._push_executor: ThreadPoolExecutor | None = None
         self._pending_push: Future | None = None
@@ -406,6 +457,7 @@ class DAggerStrategy(RolloutStrategy):
         self._episode_lock = Lock()
 
         self._episode_saver: AsyncEpisodeSaver | None = None
+        self._synchronous_persistence_failed = False
         self._rate_limiter = PolicyActionRateLimiter(
             blend_duration_s=config.resume_blend_duration_s,
             max_velocity=config.max_action_velocity,
@@ -413,6 +465,14 @@ class DAggerStrategy(RolloutStrategy):
 
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine and input device listener."""
+        self._synchronous_persistence_failed = False
+        if self.config.correction_persistence == "synchronous":
+            raw_robot = getattr(ctx.hardware.robot_wrapper, "inner", ctx.hardware.robot_wrapper)
+            if not bool(getattr(raw_robot, "maintains_paused_hold_during_persistence", False)):
+                raise RuntimeError(
+                    "Synchronous DAgger correction persistence requires a robot whose lower-level "
+                    "controller declares maintains_paused_hold_during_persistence=True"
+                )
         self._init_engine(ctx)
         self._push_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dagger-push")
         target_mb = self.config.target_video_file_size_mb or DEFAULT_VIDEO_FILE_SIZE_IN_MB
@@ -423,12 +483,17 @@ class DAggerStrategy(RolloutStrategy):
         if not self.config.record_autonomous:
             if ctx.data.dataset is None:
                 raise RuntimeError("DAgger corrections-only mode requires a writable dataset")
-            self._episode_saver = AsyncEpisodeSaver(
-                ctx.data.dataset, dataset_lock=self._episode_lock, thread_name_prefix="dagger-save"
-            )
+            if self.config.correction_persistence == "background":
+                self._episode_saver = AsyncEpisodeSaver(
+                    ctx.data.dataset, dataset_lock=self._episode_lock, thread_name_prefix="dagger-save"
+                )
 
         if self.config.input_device == "keyboard":
-            self._listener = _init_dagger_keyboard(self._events, self.config.keyboard)
+            self._listener = _init_dagger_keyboard(
+                self._events,
+                self.config.keyboard,
+                allow_discard=not self.config.record_autonomous,
+            )
             if self._listener is None:
                 raise RuntimeError("DAgger cannot start because no keyboard input backend is available")
             self._raise_if_keyboard_listener_failed()
@@ -437,12 +502,51 @@ class DAggerStrategy(RolloutStrategy):
             if self._pedal_thread is None:
                 raise RuntimeError("DAgger cannot start because no pedal input backend is available")
 
+        if self.config.web_ui.enabled:
+            task = ctx.runtime.cfg.dataset.single_task if ctx.runtime.cfg.dataset else ctx.runtime.cfg.task
+            if self.config.num_episodes is None:
+                raise RuntimeError("DAgger num_episodes must be resolved before starting the web UI")
+            self._web_ui = DAggerWebUI(
+                port=self.config.web_ui.port,
+                auto_port=self.config.web_ui.auto_port,
+                preview_enabled=self.config.web_ui.camera_preview,
+                preview_fps=self.config.web_ui.preview_fps,
+                jpeg_quality=self.config.web_ui.jpeg_quality,
+                command_handlers={
+                    "pause": lambda: self._events.request_transition(
+                        "pause_resume", expected_phase=DAggerPhase.AUTONOMOUS
+                    ),
+                    "resume": lambda: self._events.request_transition(
+                        "pause_resume", expected_phase=DAggerPhase.PAUSED
+                    ),
+                    "start-correction": lambda: self._events.request_transition(
+                        "correction", expected_phase=DAggerPhase.PAUSED
+                    ),
+                    "finish-correction": lambda: self._events.request_transition(
+                        "correction", expected_phase=DAggerPhase.CORRECTING
+                    ),
+                    "discard-correction": lambda: (
+                        not self.config.record_autonomous
+                        and self._events.request_transition("discard", expected_phase=DAggerPhase.CORRECTING)
+                    ),
+                    "upload": self._events.request_upload,
+                    "stop": self._events.request_stop,
+                },
+                task=task,
+                target_episodes=self.config.num_episodes,
+                discard_enabled=not self.config.record_autonomous,
+            )
+            self._web_ui.start()
+
         record_mode = "all frames (sentry-like)" if self.config.record_autonomous else "corrections only"
         logger.info(
-            "DAgger strategy ready (input=%s, episodes=%d, record=%s, episode_duration=%.0fs)",
+            "DAgger strategy ready (input=%s, web_ui=%s, episodes=%d, record=%s, "
+            "correction_persistence=%s, episode_duration=%.0fs)",
             self.config.input_device,
+            self._web_ui.url if self._web_ui is not None else "disabled",
             self.config.num_episodes,
             record_mode,
+            self.config.correction_persistence,
             self._episode_duration_s,
         )
 
@@ -463,6 +567,63 @@ class DAggerStrategy(RolloutStrategy):
             "DAgger keyboard input listener stopped unexpectedly; "
             "stopping control before sending additional robot commands"
         )
+
+    @staticmethod
+    def _observation_after_synchronous_persistence(
+        robot,
+        *,
+        timeout_s: float = 2.0,
+    ) -> dict[str, Any]:
+        """Wait briefly for camera threads starved by synchronous dataset I/O.
+
+        Synchronous persistence intentionally runs only after the robot has
+        entered PAUSED. Image embedding can monopolize CPU long enough for an
+        OpenCV latest-frame timestamp to exceed its 500 ms age limit. Give the
+        capture threads a bounded opportunity to publish a fresh frame before
+        treating the timeout as a real control fault.
+        """
+        deadline = time.perf_counter() + timeout_s
+        first_timeout: TimeoutError | None = None
+        while True:
+            try:
+                observation = robot.get_observation()
+            except TimeoutError as error:
+                if first_timeout is None:
+                    first_timeout = error
+                    logger.warning(
+                        "Camera observation was stale immediately after synchronous episode "
+                        "persistence; waiting up to %.1fs for capture threads to recover: %s",
+                        timeout_s,
+                        error,
+                    )
+                remaining_s = deadline - time.perf_counter()
+                if remaining_s <= 0:
+                    raise first_timeout from None
+                precise_sleep(min(1 / 30, remaining_s))
+                continue
+            if first_timeout is not None:
+                logger.info("Fresh camera observation recovered after synchronous episode persistence")
+            return observation
+
+    def _publish_web_ui(
+        self,
+        *,
+        phase: DAggerPhase,
+        recorded_episodes: int,
+        save_pending: bool,
+        observation: dict[str, Any] | None = None,
+        fault: str | None = None,
+    ) -> None:
+        if self._web_ui is None:
+            return
+        self._web_ui.publish_status(
+            phase=phase.value,
+            recorded_episodes=recorded_episodes,
+            save_pending=save_pending,
+            fault=fault,
+        )
+        if observation is not None:
+            self._web_ui.submit_observation(observation)
 
     def _resume_from_fresh_observation(
         self,
@@ -618,6 +779,15 @@ class DAggerStrategy(RolloutStrategy):
                 self._record_teardown_error(ctx, teardown_errors, error, "announcement")
                 logger.exception("Failed to announce DAgger shutdown; continuing hardware teardown")
 
+            if self._web_ui is not None:
+                logger.info("Stopping DAgger web UI")
+                web_ui, self._web_ui = self._web_ui, None
+                try:
+                    web_ui.stop()
+                except BaseException as error:
+                    self._record_teardown_error(ctx, teardown_errors, error, "web UI")
+                    logger.exception("Failed to stop DAgger web UI; continuing hardware teardown")
+
             if self._listener is not None:
                 if key_listener_is_alive(self._listener):
                     logger.info("Stopping keyboard listener")
@@ -642,16 +812,21 @@ class DAggerStrategy(RolloutStrategy):
             saver_error: BaseException | None = None
             save_was_pending = False
             save_submitted = False
+            discard_intent = self._events.discard_requested.is_set()
+            saver_dataset_lock = self._episode_saver.dataset_lock
             try:
                 save_was_pending = self._episode_saver.save_pending
                 if not save_was_pending and ctx.data.dataset is not None:
-                    # save_episode mutates the episode buffer. Never inspect it
+                    # Save/discard mutates the episode buffer. Never inspect it
                     # concurrently with the background worker.
-                    with self._episode_saver.dataset_lock:
+                    with saver_dataset_lock:
                         has_pending_frames = ctx.data.dataset.has_pending_frames()
                     if has_pending_frames:
-                        self._episode_saver.submit_save_episode()
-                        save_submitted = True
+                        if discard_intent:
+                            self._episode_saver.submit_discard_episode()
+                        else:
+                            self._episode_saver.submit_save_episode()
+                            save_submitted = True
             except BaseException as error:
                 saver_error = error
                 logger.exception("Asynchronous episode persistence failed")
@@ -665,18 +840,45 @@ class DAggerStrategy(RolloutStrategy):
                 logger.exception("Failed to shut down asynchronous episode persistence")
             finally:
                 self._episode_saver = None
-            if saver_error is None and (save_was_pending or save_submitted):
+
+            # A discard request wins over the generic teardown behavior that
+            # normally saves an unfinished correction. Retry synchronously only
+            # after hardware shutdown and worker termination if frames remain.
+            if discard_intent and ctx.data.dataset is not None:
+                try:
+                    with saver_dataset_lock:
+                        if ctx.data.dataset.has_pending_frames():
+                            ctx.data.dataset.clear_episode_buffer(delete_images=True)
+                    self._events.discard_requested.clear()
+                except BaseException as error:
+                    if saver_error is None:
+                        saver_error = error
+                    else:
+                        saver_error.add_note(f"Additional episode discard error: {error!r}")
+                    logger.exception("Failed to discard the requested correction buffer")
+
+            if saver_error is None and (save_submitted or (save_was_pending and not discard_intent)):
                 self._needs_push.set()
             if saver_error is not None:
                 self._record_teardown_error(ctx, teardown_errors, saver_error, "episode saver")
+        elif self._synchronous_persistence_failed:
+            logger.critical(
+                "Skipping teardown retry of a partially failed synchronous episode save"
+            )
         elif ctx.data.dataset is not None and ctx.data.dataset.has_pending_frames():
             try:
                 with self._episode_lock:
-                    ctx.data.dataset.save_episode()
-                self._needs_push.set()
+                    if self._events.discard_requested.is_set():
+                        ctx.data.dataset.clear_episode_buffer(delete_images=True)
+                        self._events.discard_requested.clear()
+                        logger.info("Final in-progress correction discarded after hardware shutdown")
+                    else:
+                        ctx.data.dataset.save_episode(parallel_encoding=False)
+                        self._needs_push.set()
             except BaseException as error:
-                self._record_teardown_error(ctx, teardown_errors, error, "episode save")
-                logger.exception("Failed to save final in-progress episode")
+                operation = "discard" if self._events.discard_requested.is_set() else "save"
+                self._record_teardown_error(ctx, teardown_errors, error, f"episode {operation}")
+                logger.exception("Failed to %s final in-progress episode", operation)
         # Flush any queued/running push cleanly
         if self._push_executor is not None:
             logger.info("Shutting down push executor (waiting for pending pushes)...")
@@ -757,6 +959,11 @@ class DAggerStrategy(RolloutStrategy):
         episodes_since_push = 0
         episode_duration_s = self._episode_duration_s
         logger.info("DAgger continuous recording started (episode_duration=%.0fs)", episode_duration_s)
+        self._publish_web_ui(
+            phase=events.phase,
+            recorded_episodes=dataset.num_episodes,
+            save_pending=False,
+        )
 
         with contextlib.nullcontext():
             try:
@@ -790,6 +997,15 @@ class DAggerStrategy(RolloutStrategy):
                             # boundary can retry old_phase -> PAUSED safely.
                             events.phase = old_phase
                             raise
+                        if self._web_ui is not None:
+                            self._web_ui.acknowledge_transition()
+
+                    if events.upload_requested.is_set():
+                        events.upload_requested.clear()
+                        logger.info("Upload requested by user")
+                        self._background_push(dataset, cfg)
+                        if self._web_ui is not None:
+                            self._web_ui.acknowledge_upload()
 
                     phase = events.phase
                     obs = robot.get_observation()
@@ -803,6 +1019,12 @@ class DAggerStrategy(RolloutStrategy):
                     # then maintained once per tick in every DAgger phase.
                     teleop_action = teleop.get_action() if phase == DAggerPhase.CORRECTING else None
                     _send_continuous_feedback(teleop, obs)
+                    self._publish_web_ui(
+                        phase=phase,
+                        recorded_episodes=dataset.num_episodes,
+                        save_pending=False,
+                        observation=obs,
+                    )
 
                     # --- CORRECTING: human teleop control ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
@@ -915,6 +1137,11 @@ class DAggerStrategy(RolloutStrategy):
                 active_error = sys.exception()
                 try:
                     _pause_dagger_control_before_loop_exit(engine, events, robot)
+                    self._publish_web_ui(
+                        phase=events.phase,
+                        recorded_episodes=dataset.num_episodes,
+                        save_pending=False,
+                    )
                 except BaseException as pause_error:
                     if ctx.hardware.control_fault is None:
                         ctx.hardware.control_fault = active_error or pause_error
@@ -947,8 +1174,10 @@ class DAggerStrategy(RolloutStrategy):
         interpolator = self._interpolator
         features = ctx.data.dataset_features
         saver = self._episode_saver
-        if saver is None:
+        if self.config.correction_persistence == "background" and saver is None:
             raise RuntimeError("DAgger corrections-only episode saver was not initialized")
+        if self.config.correction_persistence == "synchronous" and saver is not None:
+            raise RuntimeError("Synchronous DAgger persistence must not start a background episode saver")
 
         control_interval = interpolator.get_control_interval(cfg.fps)
         record_stride = max(1, cfg.interpolation_multiplier)
@@ -967,6 +1196,11 @@ class DAggerStrategy(RolloutStrategy):
         logger.info(
             "DAgger corrections-only recording started (target: %d episodes)", self.config.num_episodes
         )
+        self._publish_web_ui(
+            phase=events.phase,
+            recorded_episodes=recorded,
+            save_pending=False,
+        )
 
         with contextlib.nullcontext():
             try:
@@ -976,6 +1210,7 @@ class DAggerStrategy(RolloutStrategy):
                     and not ctx.runtime.shutdown_event.is_set()
                 ):
                     loop_start = time.perf_counter()
+                    synchronous_persistence_completed = False
 
                     self._raise_if_keyboard_listener_failed()
 
@@ -985,16 +1220,21 @@ class DAggerStrategy(RolloutStrategy):
 
                     # Collect a completed background result without blocking the
                     # feedback loop. Space and Tab stay pending while saving.
-                    if saver.save_pending and not saver.save_in_progress:
-                        if saver.wait_for_pending_save():
+                    if saver is not None and saver.save_pending and not saver.save_in_progress:
+                        completed_operation = saver.wait_for_pending_operation()
+                        if completed_operation == "save":
                             self._needs_push.set()
-                        logger.info("Previous correction persistence completed")
+                        elif completed_operation == "discard":
+                            events.discard_requested.clear()
+                        logger.info("Previous correction %s completed", completed_operation)
 
                     # Process transitions
                     entered_paused = False
-                    transition = events.consume_transition(paused_transition_ready=not saver.save_pending)
+                    transition = events.consume_transition_with_event(
+                        paused_transition_ready=saver is None or not saver.save_pending
+                    )
                     if transition is not None:
-                        old_phase, new_phase = transition
+                        old_phase, new_phase, transition_event = transition
                         entered_paused = new_phase == DAggerPhase.PAUSED
                         try:
                             resume_pending = self._apply_transition(
@@ -1010,27 +1250,96 @@ class DAggerStrategy(RolloutStrategy):
                             # fully applied phase for the exit PAUSED retry.
                             events.phase = old_phase
                             raise
+                        if self._web_ui is not None:
+                            self._web_ui.acknowledge_transition()
 
                         # Persist in the background while PAUSED hold and feedback
-                        # continue at the control-loop frequency.
+                        # continue at the control-loop frequency, or synchronously
+                        # while a deployment-specific lower-level controller holds.
                         if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
-                            saver.submit_save_episode()
-                            recorded += 1
-                            logger.info(
-                                "Correction %d/%d queued for persistence",
-                                recorded,
-                                self.config.num_episodes,
-                            )
-                            log_say(f"Correction {recorded} queued", play_sounds)
+                            if saver is not None:
+                                if transition_event == "discard":
+                                    saver.submit_discard_episode()
+                                    logger.info(
+                                        "Correction queued for discard; episode count remains %d", recorded
+                                    )
+                                    log_say("Correction queued for discard", play_sounds)
+                                else:
+                                    saver.submit_save_episode()
+                                    recorded += 1
+                                    logger.info(
+                                        "Correction %d/%d queued for persistence",
+                                        recorded,
+                                        self.config.num_episodes,
+                                    )
+                                    log_say(f"Correction {recorded} queued", play_sounds)
+                            else:
+                                self._publish_web_ui(
+                                    phase=new_phase,
+                                    recorded_episodes=recorded,
+                                    save_pending=True,
+                                )
+                                if transition_event == "discard":
+                                    logger.info(
+                                        "Discarding correction synchronously while DAgger remains PAUSED"
+                                    )
+                                    with self._episode_lock:
+                                        dataset.clear_episode_buffer(delete_images=True)
+                                    events.discard_requested.clear()
+                                    logger.info(
+                                        "Correction discarded; episode count remains %d", recorded
+                                    )
+                                    log_say("Correction discarded", play_sounds)
+                                else:
+                                    next_episode = recorded + 1
+                                    logger.info(
+                                        "Saving correction %d/%d synchronously while DAgger remains PAUSED",
+                                        next_episode,
+                                        self.config.num_episodes,
+                                    )
+                                    try:
+                                        with self._episode_lock:
+                                            dataset.save_episode(parallel_encoding=False)
+                                    except BaseException:
+                                        # save_episode mutates its input buffer before all
+                                        # persistence steps complete. Never retry a partially
+                                        # failed synchronous save during teardown.
+                                        self._synchronous_persistence_failed = True
+                                        raise
+                                    recorded = next_episode
+                                    self._needs_push.set()
+                                    logger.info(
+                                        "Correction %d/%d saved synchronously",
+                                        recorded,
+                                        self.config.num_episodes,
+                                    )
+                                    log_say(f"Correction {recorded} saved", play_sounds)
+                                self._publish_web_ui(
+                                    phase=new_phase,
+                                    recorded_episodes=recorded,
+                                    save_pending=False,
+                                )
+                                synchronous_persistence_completed = True
 
                     # On-demand upload
                     if events.upload_requested.is_set():
                         events.upload_requested.clear()
                         logger.info("Upload requested by user")
                         self._background_push(dataset, cfg)
+                        if self._web_ui is not None:
+                            self._web_ui.acknowledge_upload()
 
                     phase = events.phase
-                    obs = robot.get_observation()
+                    if synchronous_persistence_completed:
+                        if (
+                            recorded >= self.config.num_episodes
+                            or events.stop_recording.is_set()
+                            or ctx.runtime.shutdown_event.is_set()
+                        ):
+                            continue
+                        obs = self._observation_after_synchronous_persistence(robot)
+                    else:
+                        obs = robot.get_observation()
                     if entered_paused:
                         last_action = self._measured_hold_action(
                             last_action, obs, list(ctx.data.ordered_action_keys)
@@ -1041,6 +1350,12 @@ class DAggerStrategy(RolloutStrategy):
                     # then maintained once per tick in every DAgger phase.
                     teleop_action = teleop.get_action() if phase == DAggerPhase.CORRECTING else None
                     _send_continuous_feedback(teleop, obs)
+                    self._publish_web_ui(
+                        phase=phase,
+                        recorded_episodes=recorded,
+                        save_pending=saver is not None and saver.save_pending,
+                        observation=obs,
+                    )
 
                     # --- CORRECTING: human teleop control + recording ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
@@ -1058,14 +1373,17 @@ class DAggerStrategy(RolloutStrategy):
                         if record_tick % record_stride == 0:
                             obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                             action_frame = build_dataset_frame(features, processed_teleop, prefix=ACTION)
-                            saver.add_frame(
-                                {
-                                    **obs_frame,
-                                    **action_frame,
-                                    "task": task_str,
-                                    "intervention": np.array([True], dtype=bool),
-                                }
-                            )
+                            frame = {
+                                **obs_frame,
+                                **action_frame,
+                                "task": task_str,
+                                "intervention": np.array([True], dtype=bool),
+                            }
+                            if saver is not None:
+                                saver.add_frame(frame)
+                            else:
+                                with self._episode_lock:
+                                    dataset.add_frame(frame)
                         record_tick += 1
 
                     # --- PAUSED: hold position ---
@@ -1122,6 +1440,11 @@ class DAggerStrategy(RolloutStrategy):
                 active_error = sys.exception()
                 try:
                     _pause_dagger_control_before_loop_exit(engine, events, robot)
+                    self._publish_web_ui(
+                        phase=events.phase,
+                        recorded_episodes=recorded,
+                        save_pending=saver is not None and saver.save_pending,
+                    )
                 except BaseException as pause_error:
                     if ctx.hardware.control_fault is None:
                         ctx.hardware.control_fault = active_error or pause_error

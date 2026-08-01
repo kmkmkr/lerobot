@@ -32,7 +32,10 @@ MIT制御コマンドの速度目標は`0`、トルクフィードフォワー�
 摩擦補償の和です。follower観測に`.vel`が含まれる場合、leader feedbackはその速度も参照します。
 
 native RT bridgeではPDゲインと補償をLeRobot pluginへ複製しません。native
-`bilateral_control`が同じ`leader.yaml`、`follower.yaml`と実効J7 tuningを直接使用します。
+`bilateral_control`が同じ`leader.yaml`、`follower.yaml`を直接使用します。superprojectの
+RTランチャーはDora収集ランチャーから既定J7 profileを解決し、左右leader/followerへ
+同じJ7 Kp・重力・`Fc/Fv/Fo` scaleを明示的に渡します。絶対J7 `Fo` overrideも空へ固定し、
+ホスト環境に残ったnative overrideが既定値を変えないようにします。
 LeRobot公開境界の位置・速度はdegreeとdegree/s、socket上はradとrad/s、torqueは両方でN.mです。
 現在のDora変換dataset/checkpoint metadataは全要素`0`のtorque観測channelを持つため、
 raw APIの互換値は`torque_observation_mode=zero`です。`measured`はraw Robot APIでnativeの
@@ -124,8 +127,8 @@ friction = Fc * tanh(0.1 * k * dq) + Fv * dq + Fo
 `J7_TUNING_PROFILE=official`を指定した場合、これらのJ7 scale overrideは適用されず、
 roleごとのYAML値が使用されます。
 
-LeRobotのleader/follower既定値は、Dora通常起動の`J7_TUNING_PROFILE=validated`を
-含む上記の値です。
+LeRobotのleader/follower既定値とnative RT bridgeランチャーの既定値は、どちらも
+Dora通常起動の`J7_TUNING_PROFILE=validated`を含む上記の値です。
 重力項はwrapperがnative `openarm_teleop.sif`内のOpenArm Description 1.0.4から毎回生成する
 v10 bimanual URDFを用いて計算します。摩擦項は同じ式とrad/s単位を使用します。したがって、
 bilateral収集の両role、policy推論、CSV再生でnativeの対応roleと同じ数値・モデルの補償を

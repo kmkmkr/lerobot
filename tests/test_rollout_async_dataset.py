@@ -29,7 +29,11 @@ class _BlockingDataset:
         self.save_started = threading.Event()
         self.release_save = threading.Event()
         self.save_finished = threading.Event()
+        self.discard_started = threading.Event()
+        self.release_discard = threading.Event()
+        self.discard_finished = threading.Event()
         self.save_thread_names: list[str] = []
+        self.discard_thread_names: list[str] = []
         self.parallel_encoding_values: list[bool] = []
         self.save_error: Exception | None = None
 
@@ -49,6 +53,15 @@ class _BlockingDataset:
             raise self.save_error
         self.frames.clear()
         self.save_finished.set()
+
+    def clear_episode_buffer(self, delete_images: bool = True) -> None:
+        assert delete_images is True
+        self.discard_thread_names.append(threading.current_thread().name)
+        self.discard_started.set()
+        if not self.release_discard.wait(timeout=5):
+            raise TimeoutError("test did not release the discard worker")
+        self.frames.clear()
+        self.discard_finished.set()
 
 
 def test_save_runs_on_background_worker_and_defaults_to_sequential_encoding() -> None:
@@ -86,6 +99,26 @@ def test_frames_are_rejected_until_finished_save_is_explicitly_collected() -> No
     saver.add_frame({"frame": 1})
     assert dataset.frames == [{"frame": 1}]
     dataset.release_save.set()
+    saver.shutdown()
+
+
+def test_discard_runs_on_background_worker_and_does_not_report_a_save() -> None:
+    dataset = _BlockingDataset()
+    saver = AsyncEpisodeSaver(dataset, thread_name_prefix="test-episode-discard")
+    saver.add_frame({"frame": 0})
+
+    future = saver.submit_discard_episode()
+
+    assert dataset.discard_started.wait(timeout=1)
+    assert not future.done()
+    assert saver.pending_operation == "discard"
+    assert dataset.discard_thread_names == ["test-episode-discard_0"]
+
+    dataset.release_discard.set()
+    assert saver.wait_for_pending_operation() == "discard"
+    assert dataset.discard_finished.is_set()
+    assert dataset.frames == []
+    assert saver.wait_for_pending_save() is False
     saver.shutdown()
 
 

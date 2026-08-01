@@ -19,9 +19,10 @@ until persistence (including optional video encoding) has finished.  Recording
 another frame at the same time is therefore unsafe.  :class:`AsyncEpisodeSaver`
 provides an exclusive facade around that buffer:
 
-* ``submit_save_episode`` moves persistence to one background worker;
-* ``add_frame`` rejects writes while a save result is awaiting collection; and
-* ``wait_for_pending_save`` must succeed before the next recording starts.
+* ``submit_save_episode`` and ``submit_discard_episode`` move buffer work to one
+  background worker;
+* ``add_frame`` rejects writes while an operation result awaits collection; and
+* ``wait_for_pending_operation`` must succeed before the next recording starts.
 
 The intended DAgger flow is to submit a completed correction as it enters the
 paused phase, keep running the hardware hold/feedback loop, then collect the
@@ -32,7 +33,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 
 class _WritableEpisodeDataset(Protocol):
@@ -41,6 +42,8 @@ class _WritableEpisodeDataset(Protocol):
     def add_frame(self, frame: dict[str, Any]) -> None: ...
 
     def save_episode(self, episode_data: dict | None = None, parallel_encoding: bool = True) -> None: ...
+
+    def clear_episode_buffer(self, delete_images: bool = True) -> None: ...
 
     def has_pending_frames(self) -> bool: ...
 
@@ -76,8 +79,15 @@ class AsyncEpisodeSaver:
         self._state_lock = Lock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=thread_name_prefix)
         self._pending_save: Future[None] | None = None
+        self._pending_operation: Literal["save", "discard"] | None = None
         self._failure: BaseException | None = None
         self._closed = False
+
+    @property
+    def pending_operation(self) -> Literal["save", "discard"] | None:
+        """Dataset operation whose result still needs to be collected."""
+        with self._state_lock:
+            return self._pending_operation
 
     @property
     def dataset_lock(self) -> Any:
@@ -86,7 +96,7 @@ class AsyncEpisodeSaver:
 
     @property
     def save_pending(self) -> bool:
-        """Whether a save result still needs to be collected.
+        """Whether a save or discard result still needs to be collected.
 
         This remains true after the worker finishes.  The explicit collection
         requirement prevents a completed background exception from being
@@ -97,30 +107,31 @@ class AsyncEpisodeSaver:
 
     @property
     def save_in_progress(self) -> bool:
-        """Whether the background worker is actively persisting an episode."""
+        """Whether the background worker is actively saving or discarding."""
         with self._state_lock:
             return self._pending_save is not None and not self._pending_save.done()
 
     def _raise_if_unusable_locked(self) -> None:
         if self._failure is not None:
             raise AsyncEpisodeSaveError(
-                "The previous episode save failed; this dataset writer cannot safely record another episode."
+                "The previous episode operation failed; this dataset writer cannot safely record another episode."
             ) from self._failure
         if self._closed:
             raise RuntimeError("The asynchronous episode saver is closed.")
 
     def add_frame(self, frame: dict[str, Any]) -> None:
-        """Add one frame when no save result is pending.
+        """Add one frame when no dataset operation result is pending.
 
-        A finished but uncollected save still blocks writes.  Call
-        :meth:`wait_for_pending_save` before starting the next recording.
+        A finished but uncollected operation still blocks writes. Call
+        :meth:`wait_for_pending_operation` before starting the next recording.
         """
         with self._state_lock:
             self._raise_if_unusable_locked()
             if self._pending_save is not None:
                 raise RuntimeError(
-                    "Cannot add a frame while an episode save result is pending; "
-                    "call wait_for_pending_save() before the next recording."
+                    "Cannot add a frame while an episode operation result is pending; "
+                    "call wait_for_pending_operation() (or wait_for_pending_save()) "
+                    "before the next recording."
                 )
             with self._dataset_lock:
                 self._dataset.add_frame(frame)
@@ -141,36 +152,56 @@ class AsyncEpisodeSaver:
         with self._state_lock:
             self._raise_if_unusable_locked()
             if self._pending_save is not None:
-                raise RuntimeError("An episode save result is already pending collection.")
+                raise RuntimeError("An episode operation result is already pending collection.")
             with self._dataset_lock:
                 if not self._dataset.has_pending_frames():
                     raise RuntimeError("Cannot save an episode with no pending frames.")
 
             future = self._executor.submit(self._save_episode, parallel_encoding)
             self._pending_save = future
+            self._pending_operation = "save"
             return future
 
     def _save_episode(self, parallel_encoding: bool) -> None:
         with self._dataset_lock:
             self._dataset.save_episode(parallel_encoding=parallel_encoding)
 
-    def wait_for_pending_save(self) -> bool:
-        """Collect the pending save and admit frames for the next episode.
+    def submit_discard_episode(self) -> Future[None]:
+        """Discard the current correction on the background worker.
 
-        Returns ``True`` when a save was collected and ``False`` when there was
-        no pending save.  A save exception is re-raised and permanently poisons
-        this helper because ``DatasetWriter.save_episode`` may already have
-        partially mutated its buffer or metadata.
+        Clearing a video/image episode can wait for outstanding image writes
+        and delete temporary files, so it must not run in the hardware loop.
+        """
+        with self._state_lock:
+            self._raise_if_unusable_locked()
+            if self._pending_save is not None:
+                raise RuntimeError("An episode operation result is already pending collection.")
+            future = self._executor.submit(self._discard_episode)
+            self._pending_save = future
+            self._pending_operation = "discard"
+            return future
+
+    def _discard_episode(self) -> None:
+        with self._dataset_lock:
+            self._dataset.clear_episode_buffer(delete_images=True)
+
+    def wait_for_pending_operation(self) -> Literal["save", "discard"] | None:
+        """Collect a pending save/discard and admit the next correction.
+
+        Returns the completed operation name or ``None`` when nothing was
+        pending. Any worker exception permanently poisons this helper because
+        the mutable episode buffer may already have been partially changed.
         """
         with self._state_lock:
             if self._failure is not None:
                 raise AsyncEpisodeSaveError(
-                    "The previous episode save failed; this dataset writer cannot safely continue."
+                    "The previous episode operation failed; this dataset writer cannot safely continue."
                 ) from self._failure
             pending = self._pending_save
+            operation = self._pending_operation
 
         if pending is None:
-            return False
+            return None
 
         try:
             pending.result()
@@ -178,16 +209,26 @@ class AsyncEpisodeSaver:
             with self._state_lock:
                 if self._pending_save is pending:
                     self._pending_save = None
+                    self._pending_operation = None
                     self._failure = exc
             raise
 
         with self._state_lock:
             if self._pending_save is pending:
                 self._pending_save = None
-        return True
+                self._pending_operation = None
+        return operation
 
-    def shutdown(self) -> None:
-        """Collect pending persistence and stop the worker.
+    def wait_for_pending_save(self) -> bool:
+        """Compatibility wrapper that reports whether a save was collected.
+
+        A completed discard returns ``False`` because it does not create data
+        that needs uploading.
+        """
+        return self.wait_for_pending_operation() == "save"
+
+    def shutdown(self) -> Literal["save", "discard"] | None:
+        """Collect pending buffer work and stop the worker.
 
         The worker is always shut down, including when collection raises.  The
         first call propagates the original background exception; later calls
@@ -197,10 +238,10 @@ class AsyncEpisodeSaver:
             if self._closed:
                 if self._failure is not None:
                     raise AsyncEpisodeSaveError("The asynchronous episode saver failed.") from self._failure
-                return
+                return None
             self._closed = True
 
         try:
-            self.wait_for_pending_save()
+            return self.wait_for_pending_operation()
         finally:
             self._executor.shutdown(wait=True)

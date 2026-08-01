@@ -13,6 +13,8 @@ PROFILE="/workspace/openarm_startup_trajectories/task_ready_20260718_180030"
 POLICY_PATH="/home/mkj/gitrepo/openarm-bilateral-teleop-lerobot-deploy/checkpoint/pi05_openarm_rel_cam_20260726/checkpoints/060000/pretrained_model"
 TASK='Pick up the large green gear and place it in the red recessed area of the blue board.'
 DAGGER_DATASET_ROOT="${DAGGER_DATASET_ROOT:-./data/rollout_openarm_dagger_$(date +%Y%m%d_%H%M%S)}"
+DAGGER_UI_PORT="${DAGGER_UI_PORT:-8000}"
+DAGGER_UI_PREVIEW_FPS="${DAGGER_UI_PREVIEW_FPS:-5}"
 
 
 apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-rollout \
@@ -42,6 +44,11 @@ apptainer/openarm_lerobot_exec.sh .venv/bin/lerobot-rollout \
     --strategy.record_autonomous=false \
     --strategy.num_episodes=2 \
     --strategy.input_device=keyboard \
+    --strategy.web_ui.enabled=true \
+    --strategy.web_ui.port="$DAGGER_UI_PORT" \
+    --strategy.web_ui.auto_port=true \
+    --strategy.web_ui.camera_preview=true \
+    --strategy.web_ui.preview_fps="$DAGGER_UI_PREVIEW_FPS" \
     --strategy.resume_blend_duration_s=2.0 \
     --strategy.max_action_velocity=10.0 \
     --teleop.type=bi_openarm_leader \

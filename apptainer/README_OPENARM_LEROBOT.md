@@ -47,7 +47,13 @@ The native processes implement the phase behavior directly:
   may disable torque and exit; no fault initiates an automatic return trajectory.
 
 This avoids implementing a 1 kHz torque loop in Python and keeps the native
-Dora controller as the source of truth. Only a small, generic opt-in
+Dora controller as the source of truth. The superproject launcher resolves the
+Dora collection launcher's default J7 tuning profile and explicitly passes the
+same role-specific PD and gravity/friction scales to both native processes;
+the remaining joints use the same native `leader.yaml` and `follower.yaml` in
+both paths. It also clears the native absolute J7 `Fo` overrides explicitly so
+stale host environment variables cannot change the default. Only a small,
+generic opt-in
 `set_intervention_phase(old_phase, new_phase)` notification hook lives in the
 LeRobot checkout; the production RT path requires its version-2 transition and
 loop-exit PAUSED boundaries. Plugin discovery, the socket protocol, and
@@ -353,14 +359,20 @@ joint-limit, velocity, exact-target clipping, and tracking-error checks.
 
 DAgger starts in autonomous policy mode. For a keyboard-controlled session,
 press Space to pause policy execution, Tab to start or finish a human
-correction, Space from the paused phase to resume the policy, and Escape to
-stop the session. Enter queues a Hub upload for after hardware shutdown and
-dataset finalization. Space after finishing a correction means
-`PAUSED -> AUTONOMOUS`; it does not start a new episode. The default
-`record_autonomous=false` stores each Tab-to-Tab correction window as one
-episode. Episode persistence runs in a single background worker while PAUSED
-feedback and measured-position hold commands continue. If Space or Tab is
-pressed before persistence completes, the request remains pending. With 10
+correction, Backspace while correcting to discard it, Space from the paused
+phase to resume the policy, and Escape to stop the session. Enter queues a Hub upload for after hardware shutdown and
+dataset finalization. The optional localhost web UI supplements these controls;
+the keyboard or pedal remains available as a fallback. Space after finishing a
+correction means `PAUSED -> AUTONOMOUS`; it does not start a new episode. The
+default `record_autonomous=false` stores each Tab-to-Tab correction window as
+one episode. Generic DAgger defaults to `correction_persistence=background`,
+which uses a single episode worker while PAUSED feedback and measured-position
+hold commands continue. A deployment with an independently maintained lower-level
+PAUSED hold may select `correction_persistence=synchronous`; the OpenArm RT launcher
+does so and completes each Tab save or Backspace discard on the DAgger thread before
+another phase transition is applied. Discarding does not increment the saved correction
+count. If Space or Tab is pressed before a background operation completes, the request
+remains pending. With 10
 target episodes, `video_encoding_batch_size=11` defers AV1 encoding to
 `dataset.finalize()`, after hardware has been secured and disconnected. On
 Escape, duration expiry, or reaching the target episode count, hardware
@@ -386,6 +398,12 @@ The CLI fragment to append is:
 --strategy.record_autonomous=false
 --strategy.num_episodes=10
 --strategy.input_device=keyboard
+--strategy.keyboard.discard=backspace
+--strategy.web_ui.enabled=true
+--strategy.web_ui.port=8000
+--strategy.web_ui.auto_port=true
+--strategy.web_ui.camera_preview=true
+--strategy.web_ui.preview_fps=5
 --strategy.resume_blend_duration_s=2.0
 --strategy.max_action_velocity=10.0
 --robot.left_arm_config.use_velocity_and_torque=true
@@ -407,6 +425,22 @@ The CLI fragment to append is:
 --dataset.num_image_writer_threads_per_camera=2
 --dataset.encoder_threads=1
 ```
+
+When enabled, the actual operator URL is printed as
+`DAgger operator UI: http://127.0.0.1:<port>`. If port 8000 is occupied and
+`auto_port=true`, a free loopback port is selected. The UI exposes the same
+validated transitions as Space, Tab, and Backspace: pause policy, start/finish
+or discard a correction, and resume policy. It also exposes queued upload and orderly session stop.
+Commands are protected by a per-run browser token and the server binds only to
+IPv4 loopback.
+
+Camera cards reuse the raw observations already acquired by LeRobot; the UI
+does not open `/dev/video*` a second time. A single background worker encodes
+only the newest offered frame at `preview_fps`, discarding older display work.
+Thus preview encoding and browser traffic do not enter the robot command path,
+change dataset FPS, or alter the native bilateral controller. Disable only the
+preview with `--strategy.web_ui.camera_preview=false`, or disable the entire UI
+with `--strategy.web_ui.enabled=false`.
 
 For `openarm_leader` and `bi_openarm_leader`, DAgger sends the measured
 follower observation back to the leader in autonomous, paused, and correcting
@@ -486,6 +520,12 @@ Relevant motion settings and defaults are:
 | --- | ---: | --- |
 | `strategy.resume_blend_duration_s` | `2.0` | Fresh measured pose to policy target smoothstep duration |
 | `strategy.max_action_velocity` | `None` (`dagger.sh`: `10.0`) | Per-second autonomous action limit; degrees/s for OpenArm positions |
+| `strategy.correction_persistence` | `background` (OpenArm RT launcher: `synchronous`) | Save/discard corrections in a worker, or finish each operation synchronously after entering PAUSED |
+| `strategy.keyboard.discard` | `backspace` | Discard the active corrections-only episode without incrementing its count |
+| `strategy.web_ui.enabled` | `false` (`dagger.sh`: `true`) | Serve supplemental DAgger controls on IPv4 localhost |
+| `strategy.web_ui.port` | `8000` | Requested UI port; `0` selects a free port |
+| `strategy.web_ui.auto_port` | `true` | Select a free port when the requested port is occupied |
+| `strategy.web_ui.preview_fps` | `5.0` | Latest-only background JPEG preview rate; recording remains at dataset FPS |
 | `robot.{left,right}_arm_config.use_velocity_and_torque` | `false` (`dagger.sh`: `true`) | Expose follower velocity for leader feedback |
 | `teleop.{left,right}_arm_config.use_velocity_and_torque` | `false` (`dagger.sh`: `true`) | Send measured leader velocity to follower MIT control |
 | `teleop.{left,right}_arm_config.feedback_position_limit_tolerance_deg` | `1.5` | Clamp only small measured boundary overshoot; larger values fault |

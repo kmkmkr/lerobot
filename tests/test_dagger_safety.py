@@ -56,6 +56,67 @@ def test_dagger_keyboard_prefers_terminal_and_routes_space_and_tab() -> None:
     assert events.consume_transition() == (DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED)
     dispatch("tab")
     assert events.consume_transition() == (DAggerPhase.PAUSED, DAggerPhase.CORRECTING)
+    dispatch("backspace")
+    assert events.consume_transition_with_event() == (
+        DAggerPhase.CORRECTING,
+        DAggerPhase.PAUSED,
+        "discard",
+    )
+    assert events.discard_requested.is_set()
+
+
+def test_dagger_web_ui_supplements_keyboard_and_uses_the_same_events() -> None:
+    config = DAggerStrategyConfig(num_episodes=2, record_autonomous=True)
+    config.web_ui.enabled = True
+    strategy = DAggerStrategy(config)
+    listener = object()
+    dataset = MagicMock()
+    dataset.num_episodes = 0
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(
+            cfg=SimpleNamespace(
+                fps=30,
+                dataset=SimpleNamespace(single_task="task"),
+                task="task",
+            )
+        ),
+        data=SimpleNamespace(dataset=dataset, dataset_features={}),
+    )
+
+    try:
+        with (
+            patch.object(strategy, "_init_engine"),
+            patch("lerobot.rollout.strategies.dagger._init_dagger_keyboard", return_value=listener),
+            patch("lerobot.rollout.strategies.dagger.key_listener_is_alive", return_value=True),
+            patch("lerobot.rollout.strategies.dagger.DAggerWebUI") as web_ui_type,
+        ):
+            web_ui_type.return_value.url = "http://127.0.0.1:8000"
+            strategy.setup(ctx)
+
+        handlers = web_ui_type.call_args.kwargs["command_handlers"]
+        assert handlers["pause"]() is True
+        assert handlers["pause"]() is False
+        assert strategy._events.consume_transition() == (
+            DAggerPhase.AUTONOMOUS,
+            DAggerPhase.PAUSED,
+        )
+        assert handlers["pause"]() is False
+        assert handlers["start-correction"]() is True
+        assert strategy._events.consume_transition() == (
+            DAggerPhase.PAUSED,
+            DAggerPhase.CORRECTING,
+        )
+        assert handlers["discard-correction"]() is False
+        assert web_ui_type.call_args.kwargs["discard_enabled"] is False
+        assert handlers["upload"]() is True
+        assert strategy._events.upload_requested.is_set()
+        assert handlers["stop"]() is True
+        assert strategy._events.stop_recording.is_set()
+        web_ui_type.return_value.start.assert_called_once_with()
+    finally:
+        if strategy._push_executor is not None:
+            strategy._push_executor.shutdown(wait=True)
+            strategy._push_executor = None
 
 
 def test_corrections_only_dead_keyboard_listener_faults_before_robot_commands() -> None:
@@ -107,6 +168,19 @@ def test_corrections_only_dead_keyboard_listener_faults_before_robot_commands() 
     robot.get_observation.assert_not_called()
     robot.send_action.assert_not_called()
     engine.pause.assert_called_once_with()
+
+
+def test_synchronous_persistence_rejects_robot_without_independent_paused_hold() -> None:
+    strategy = DAggerStrategy(
+        DAggerStrategyConfig(correction_persistence="synchronous")
+    )
+    robot_wrapper = SimpleNamespace(inner=SimpleNamespace())
+    ctx = SimpleNamespace(hardware=SimpleNamespace(robot_wrapper=robot_wrapper))
+
+    with pytest.raises(RuntimeError, match="maintains_paused_hold_during_persistence"):
+        strategy.setup(ctx)
+
+    assert strategy._push_executor is None
 
 
 def test_policy_action_rate_limiter_blends_and_limits_by_elapsed_time() -> None:
@@ -935,6 +1009,290 @@ def test_corrections_only_stop_exits_without_collecting_pending_save() -> None:
     saver.wait_for_pending_save.assert_not_called()
     robot.get_observation.assert_not_called()
     engine.pause.assert_called_once_with()
+
+
+def test_corrections_only_discard_returns_to_paused_without_saving() -> None:
+    strategy = DAggerStrategy(DAggerStrategyConfig(num_episodes=2, input_device="pedal"))
+    engine = MagicMock()
+    engine.failed = False
+    strategy._engine = engine
+    interpolator = MagicMock()
+    interpolator.get_control_interval.return_value = 1 / 30
+    strategy._interpolator = interpolator
+    events = DAggerEvents()
+    reset_events = events.reset
+
+    def reset_into_discard_request():
+        reset_events()
+        events.phase = DAggerPhase.CORRECTING
+        assert events.request_transition("discard")
+
+    events.reset = MagicMock(side_effect=reset_into_discard_request)
+    strategy._events = events
+    saver = MagicMock()
+    saver.save_pending = False
+    strategy._episode_saver = saver
+    shutdown_event = MagicMock()
+    shutdown_event.is_set.return_value = False
+    robot = MagicMock()
+
+    def observe_then_stop():
+        events.stop_recording.set()
+        return {}
+
+    robot.get_observation.side_effect = observe_then_stop
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(
+            cfg=SimpleNamespace(
+                fps=30,
+                interpolation_multiplier=1,
+                dataset=SimpleNamespace(single_task="task"),
+                task="task",
+                play_sounds=False,
+                duration=0,
+                use_torch_compile=False,
+            ),
+            shutdown_event=shutdown_event,
+        ),
+        hardware=SimpleNamespace(
+            robot_wrapper=robot,
+            teleop=MagicMock(requires_continuous_feedback=False),
+            control_fault=None,
+        ),
+        data=SimpleNamespace(
+            dataset=MagicMock(),
+            dataset_features={},
+            ordered_action_keys=[],
+        ),
+    )
+
+    with patch("lerobot.rollout.strategies.dagger.precise_sleep"):
+        strategy._run_corrections_only(ctx)
+
+    saver.submit_discard_episode.assert_called_once_with()
+    saver.submit_save_episode.assert_not_called()
+    assert events.phase is DAggerPhase.PAUSED
+    assert events.discard_requested.is_set()
+    engine.pause.assert_called()
+
+
+def test_corrections_only_synchronous_tab_save_completes_before_loop_exit() -> None:
+    strategy = DAggerStrategy(
+        DAggerStrategyConfig(
+            num_episodes=1,
+            input_device="pedal",
+            correction_persistence="synchronous",
+        )
+    )
+    engine = MagicMock()
+    engine.failed = False
+    strategy._engine = engine
+    interpolator = MagicMock()
+    interpolator.get_control_interval.return_value = 1 / 30
+    strategy._interpolator = interpolator
+    events = DAggerEvents()
+    reset_events = events.reset
+
+    def reset_into_finish_request():
+        reset_events()
+        events.phase = DAggerPhase.CORRECTING
+        assert events.request_transition("correction")
+
+    events.reset = MagicMock(side_effect=reset_into_finish_request)
+    strategy._events = events
+    shutdown_event = MagicMock()
+    shutdown_event.is_set.return_value = False
+    robot = MagicMock()
+    dataset = MagicMock()
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(
+            cfg=SimpleNamespace(
+                fps=30,
+                interpolation_multiplier=1,
+                dataset=SimpleNamespace(single_task="task"),
+                task="task",
+                play_sounds=False,
+                duration=0,
+                use_torch_compile=False,
+            ),
+            shutdown_event=shutdown_event,
+        ),
+        hardware=SimpleNamespace(
+            robot_wrapper=robot,
+            teleop=MagicMock(requires_continuous_feedback=False),
+            control_fault=None,
+        ),
+        data=SimpleNamespace(
+            dataset=dataset,
+            dataset_features={},
+            ordered_action_keys=[],
+        ),
+    )
+
+    strategy._run_corrections_only(ctx)
+
+    dataset.save_episode.assert_called_once_with(parallel_encoding=False)
+    dataset.clear_episode_buffer.assert_not_called()
+    robot.get_observation.assert_not_called()
+    assert strategy._episode_saver is None
+    assert strategy._needs_push.is_set()
+    assert events.phase is DAggerPhase.PAUSED
+    engine.pause.assert_called()
+
+
+def test_corrections_only_synchronous_discard_clears_before_next_observation() -> None:
+    strategy = DAggerStrategy(
+        DAggerStrategyConfig(
+            num_episodes=2,
+            input_device="pedal",
+            correction_persistence="synchronous",
+        )
+    )
+    engine = MagicMock()
+    engine.failed = False
+    strategy._engine = engine
+    interpolator = MagicMock()
+    interpolator.get_control_interval.return_value = 1 / 30
+    strategy._interpolator = interpolator
+    events = DAggerEvents()
+    reset_events = events.reset
+
+    def reset_into_discard_request():
+        reset_events()
+        events.phase = DAggerPhase.CORRECTING
+        assert events.request_transition("discard")
+
+    events.reset = MagicMock(side_effect=reset_into_discard_request)
+    strategy._events = events
+    shutdown_event = MagicMock()
+    shutdown_event.is_set.return_value = False
+    calls: list[str] = []
+    dataset = MagicMock()
+    dataset.clear_episode_buffer.side_effect = lambda **_kwargs: calls.append("discard")
+    robot = MagicMock()
+
+    def observe_then_stop():
+        calls.append("observation")
+        events.stop_recording.set()
+        return {}
+
+    robot.get_observation.side_effect = observe_then_stop
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(
+            cfg=SimpleNamespace(
+                fps=30,
+                interpolation_multiplier=1,
+                dataset=SimpleNamespace(single_task="task"),
+                task="task",
+                play_sounds=False,
+                duration=0,
+                use_torch_compile=False,
+            ),
+            shutdown_event=shutdown_event,
+        ),
+        hardware=SimpleNamespace(
+            robot_wrapper=robot,
+            teleop=MagicMock(requires_continuous_feedback=False),
+            control_fault=None,
+        ),
+        data=SimpleNamespace(
+            dataset=dataset,
+            dataset_features={},
+            ordered_action_keys=[],
+        ),
+    )
+
+    with patch("lerobot.rollout.strategies.dagger.precise_sleep"):
+        strategy._run_corrections_only(ctx)
+
+    dataset.clear_episode_buffer.assert_called_once_with(delete_images=True)
+    dataset.save_episode.assert_not_called()
+    assert calls == ["discard", "observation"]
+    assert not events.discard_requested.is_set()
+    assert not strategy._needs_push.is_set()
+
+
+def test_post_synchronous_persistence_waits_for_fresh_camera_observation() -> None:
+    robot = MagicMock()
+    robot.get_observation.side_effect = [TimeoutError("stale camera"), {"camera": "fresh"}]
+
+    with patch("lerobot.rollout.strategies.dagger.precise_sleep") as sleep:
+        observation = DAggerStrategy._observation_after_synchronous_persistence(robot)
+
+    assert observation == {"camera": "fresh"}
+    sleep.assert_called_once()
+
+
+def test_dagger_teardown_never_retries_partially_failed_synchronous_save() -> None:
+    strategy = DAggerStrategy(
+        DAggerStrategyConfig(correction_persistence="synchronous")
+    )
+    strategy._synchronous_persistence_failed = True
+    hardware = SimpleNamespace(control_fault=RuntimeError("save failed"), teardown_complete=False)
+
+    def hardware_teardown(*_args, **_kwargs):
+        hardware.teardown_complete = True
+
+    strategy._teardown_hardware = MagicMock(side_effect=hardware_teardown)
+    dataset = MagicMock()
+    dataset.has_pending_frames.return_value = True
+    shutdown_event = MagicMock()
+    shutdown_event.is_set.return_value = False
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(
+            cfg=SimpleNamespace(
+                play_sounds=False,
+                return_to_initial_position=False,
+                dataset=SimpleNamespace(push_to_hub=False),
+            ),
+            shutdown_event=shutdown_event,
+        ),
+        hardware=hardware,
+        data=SimpleNamespace(dataset=dataset),
+    )
+
+    strategy.teardown(ctx)
+
+    dataset.save_episode.assert_not_called()
+    dataset.clear_episode_buffer.assert_not_called()
+    dataset.finalize.assert_called_once_with()
+
+
+def test_dagger_teardown_discard_intent_never_saves_pending_frames() -> None:
+    strategy = DAggerStrategy(DAggerStrategyConfig())
+    hardware = SimpleNamespace(control_fault=None, teardown_complete=False)
+
+    def hardware_teardown(*_args, **_kwargs):
+        hardware.teardown_complete = True
+
+    strategy._teardown_hardware = MagicMock(side_effect=hardware_teardown)
+    strategy._events.discard_requested.set()
+    saver = MagicMock()
+    saver.save_pending = False
+    saver.dataset_lock = strategy._episode_lock
+    strategy._episode_saver = saver
+    dataset = MagicMock()
+    dataset.has_pending_frames.side_effect = [True, True]
+    shutdown_event = MagicMock()
+    shutdown_event.is_set.return_value = False
+    cfg = SimpleNamespace(
+        play_sounds=False,
+        return_to_initial_position=True,
+        dataset=SimpleNamespace(push_to_hub=False),
+    )
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(cfg=cfg, shutdown_event=shutdown_event),
+        hardware=hardware,
+        data=SimpleNamespace(dataset=dataset),
+    )
+
+    strategy.teardown(ctx)
+
+    saver.submit_discard_episode.assert_called_once_with()
+    saver.submit_save_episode.assert_not_called()
+    dataset.clear_episode_buffer.assert_called_once_with(delete_images=True)
+    assert not strategy._events.discard_requested.is_set()
+    assert not strategy._needs_push.is_set()
 
 
 def test_dagger_teardown_suppresses_push_after_async_persistence_failure() -> None:

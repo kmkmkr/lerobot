@@ -78,15 +78,58 @@ def test_dagger_config_invalid_input_device():
         DAggerStrategyConfig(input_device="joystick")
 
 
+def test_dagger_keyboard_controls_must_be_distinct():
+    from lerobot.rollout import DAggerKeyboardConfig
+
+    with pytest.raises(ValueError, match="distinct keys"):
+        DAggerKeyboardConfig(correction="backspace")
+
+
 def test_dagger_config_defaults():
     from lerobot.rollout import DAggerStrategyConfig
 
     cfg = DAggerStrategyConfig()
     assert cfg.num_episodes is None
     assert cfg.record_autonomous is False
+    assert cfg.correction_persistence == "background"
     assert cfg.input_device == "keyboard"
+    assert cfg.keyboard.discard == "backspace"
     assert cfg.resume_blend_duration_s == 2.0
     assert cfg.max_action_velocity is None
+    assert cfg.web_ui.enabled is False
+    assert cfg.web_ui.port == 8000
+    assert cfg.web_ui.preview_fps == 5.0
+
+
+def test_dagger_config_rejects_invalid_correction_persistence():
+    from lerobot.rollout import DAggerStrategyConfig
+
+    with pytest.raises(ValueError, match="correction_persistence"):
+        DAggerStrategyConfig(correction_persistence="deferred")
+
+    with pytest.raises(ValueError, match="record_autonomous=False"):
+        DAggerStrategyConfig(record_autonomous=True, correction_persistence="synchronous")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"port": -1},
+        {"port": 65536},
+        {"port": True},
+        {"preview_fps": 0.0},
+        {"preview_fps": float("nan")},
+        {"preview_fps": True},
+        {"jpeg_quality": 0},
+        {"jpeg_quality": 101},
+        {"jpeg_quality": True},
+    ],
+)
+def test_dagger_web_ui_config_rejects_invalid_values(kwargs):
+    from lerobot.rollout import DAggerWebUIConfig
+
+    with pytest.raises(ValueError, match="DAgger web_ui"):
+        DAggerWebUIConfig(**kwargs)
 
 
 @pytest.mark.parametrize(
